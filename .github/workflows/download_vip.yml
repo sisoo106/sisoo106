@@ -89,7 +89,6 @@ jobs:
           COOKIE_BASE64: ${{ secrets.YOUTUBE_COOKIES }}
         run: |
           if [ -n "$COOKIE_BASE64" ]; then echo "$COOKIE_BASE64" | base64 -d > cookies.txt; fi
-        shell: bash
 
       - name: Select YouTube Quality
         if: github.event.inputs.media_url != ''
@@ -112,7 +111,6 @@ jobs:
           done
           [ -z "$SELECTED" ] && SELECTED=${MIN_Q:-360}
           echo "selected_quality=$SELECTED" >> $GITHUB_ENV
-        shell: bash
 
       - name: Download YouTube Video
         if: github.event.inputs.media_url != ''
@@ -120,7 +118,9 @@ jobs:
           YT_URL: ${{ github.event.inputs.media_url }}
           SELECTED_QUALITY: ${{ env.selected_quality }}
         run: |
-          curl -s -X POST "${{ github.event.inputs.worker_url }}/api/progress" -H "Content-Type: application/json" -d "{\"user_id\":\"${{ github.event.inputs.user_id }}\",\"stage\":\"download\",\"percent\":10}" || true
+          curl -s -X POST "${{ github.event.inputs.worker_url }}/api/progress" \
+            -H "Content-Type: application/json" \
+            -d "{\"user_id\":\"${{ github.event.inputs.user_id }}\",\"stage\":\"download\",\"percent\":10}" || true
           COOKIE_ARG=""; [ -f cookies.txt ] && COOKIE_ARG="--cookies cookies.txt"
           yt-dlp $COOKIE_ARG \
             --format "bestvideo[height<=${SELECTED_QUALITY}]+bestaudio/best[height<=${SELECTED_QUALITY}]" \
@@ -131,7 +131,6 @@ jobs:
           FILE_SIZE=$(stat -c%s "$VIDEO_FILE" 2>/dev/null || echo "0")
           echo "DOWNLOAD_FILE=$VIDEO_FILE" >> $GITHUB_ENV
           echo "DOWNLOAD_SIZE=$FILE_SIZE" >> $GITHUB_ENV
-        shell: bash
 
       - name: Download File (Link or Telegram)
         if: github.event.inputs.media_url == ''
@@ -142,51 +141,30 @@ jobs:
           INPUT_FILE_URL: ${{ github.event.inputs.file_url }}
           INPUT_FILE_ID: ${{ github.event.inputs.file_id }}
         run: |
-          curl -s -X POST "${{ github.event.inputs.worker_url }}/api/progress" -H "Content-Type: application/json" -d "{\"user_id\":\"${{ github.event.inputs.user_id }}\",\"stage\":\"download\",\"percent\":10}" || true
-          if [ -n "$INPUT_FILE_URL" ] && [ "$INPUT_FILE_URL" != "null" ] && [ "$INPUT_FILE_URL" != "" ]; then
+          curl -s -X POST "${{ github.event.inputs.worker_url }}/api/progress" \
+            -H "Content-Type: application/json" \
+            -d "{\"user_id\":\"${{ github.event.inputs.user_id }}\",\"stage\":\"download\",\"percent\":10}" || true
+          if [ -n "$INPUT_FILE_URL" ] && [ "$INPUT_FILE_URL" != "null" ]; then
             ORIGINAL_NAME=$(basename "$INPUT_FILE_URL" | cut -d '?' -f1)
             [ -z "$ORIGINAL_NAME" ] && ORIGINAL_NAME="downloaded_file"
             wget -c -t 20 -T 60 --retry-connrefused --waitretry=5 -O "$ORIGINAL_NAME" "$INPUT_FILE_URL"
-          elif [ -n "$INPUT_FILE_ID" ] && [ "$INPUT_FILE_ID" != "null" ] && [ "$INPUT_FILE_ID" != "" ]; then
-            cat > dl_script.py << 'PYEOF'
-import os, asyncio
-from pyrogram import Client
-
-async def main():
-    api_id = int(os.environ['TG_API_ID'])
-    api_hash = os.environ['TG_API_HASH']
-    session_string = os.environ['TG_SESSION_STRING']
-    file_id = os.environ['INPUT_FILE_ID']
-
-    app = Client("session", session_string=session_string,
-                 api_id=api_id, api_hash=api_hash)
-    async with app:
-        try:
-            path = await app.download_media(file_id, file_name="downloaded_file")
-        except Exception as e:
-            print(f"download_media error: {e}")
-            raise
-        if path:
-            open("filename.txt", "w").write(path)
-        else:
-            raise Exception("download_media returned None")
-
-asyncio.run(main())
-PYEOF
-            python dl_script.py
+          elif [ -n "$INPUT_FILE_ID" ] && [ "$INPUT_FILE_ID" != "null" ]; then
+            echo "aW1wb3J0IG9zLCBhc3luY2lvCmZyb20gcHlyb2dyYW0gaW1wb3J0IENsaWVudAoKYXN5bmMgZGVmIG1haW4oKToKICAgIGFwaV9pZCA9IGludChvcy5lbnZpcm9uWyJUR19BUElfSUQiXSkKICAgIGFwaV9oYXNoID0gb3MuZW52aXJvblsiVEdfQVBJX0hBU0giXQogICAgc2Vzc2lvbl9zdHJpbmcgPSBvcy5lbnZpcm9uWyJUR19TRVNTSU9OX1NUUklORyJdCiAgICBmaWxlX2lkID0gb3MuZW52aXJvblsiSU5QVVRfRklMRV9JRCJdCiAgICBhcHAgPSBDbGllbnQoInNlc3Npb24iLCBzZXNzaW9uX3N0cmluZz1zZXNzaW9uX3N0cmluZywgYXBpX2lkPWFwaV9pZCwgYXBpX2hhc2g9YXBpX2hhc2gpCiAgICBhc3luYyB3aXRoIGFwcDoKICAgICAgICB0cnk6CiAgICAgICAgICAgIHBhdGggPSBhd2FpdCBhcHAuZG93bmxvYWRfbWVkaWEoZmlsZV9pZCwgZmlsZV9uYW1lPSJkb3dubG9hZGVkX2ZpbGUiKQogICAgICAgIGV4Y2VwdCBFeGNlcHRpb24gYXMgZToKICAgICAgICAgICAgcHJpbnQoZiJkb3dubG9hZF9tZWRpYSBlcnJvcjoge2V9IikKICAgICAgICAgICAgcmFpc2UKICAgICAgICBpZiBwYXRoOgogICAgICAgICAgICBvcGVuKCJmaWxlbmFtZS50eHQiLCAidyIpLndyaXRlKHBhdGgpCiAgICAgICAgZWxzZToKICAgICAgICAgICAgcmFpc2UgRXhjZXB0aW9uKCJkb3dubG9hZF9tZWRpYSByZXR1cm5lZCBOb25lIikKCmFzeW5jaW8ucnVuKG1haW4oKSkK" | base64 -d > dl_script.py
+            python3 dl_script.py
             ORIGINAL_NAME=$(cat filename.txt 2>/dev/null || echo "")
           else
-            echo "No file_url or file_id!"; exit 1
+            echo "No file_url or file_id provided!"; exit 1
           fi
-          [ ! -s "${ORIGINAL_NAME:-downloaded_file}" ] && { echo "Empty file!"; exit 1; }
+          [ ! -s "${ORIGINAL_NAME:-downloaded_file}" ] && { echo "Downloaded file is empty!"; exit 1; }
           FILE_SIZE=$(stat -c%s "$ORIGINAL_NAME" 2>/dev/null || echo "0")
           echo "DOWNLOAD_FILE=$ORIGINAL_NAME" >> $GITHUB_ENV
           echo "DOWNLOAD_SIZE=$FILE_SIZE" >> $GITHUB_ENV
-        shell: bash
 
       - name: Notify Worker Compress
         run: |
-          curl -s -X POST "${{ github.event.inputs.worker_url }}/api/progress" -H "Content-Type: application/json" -d "{\"user_id\":\"${{ github.event.inputs.user_id }}\",\"stage\":\"compress\",\"percent\":55}" || true
+          curl -s -X POST "${{ github.event.inputs.worker_url }}/api/progress" \
+            -H "Content-Type: application/json" \
+            -d "{\"user_id\":\"${{ github.event.inputs.user_id }}\",\"stage\":\"compress\",\"percent\":55}" || true
 
       - name: Compress with Password
         env:
@@ -242,7 +220,6 @@ PYEOF
             start=$((end + 1)); sleep 2
           done
           echo "BRANCH_NAME=$BRANCH_NAME" >> $GITHUB_ENV
-        shell: bash
 
       - name: Notify Worker Complete
         if: success()

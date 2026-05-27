@@ -170,7 +170,9 @@ jobs:
         env:
           DOWNLOAD_FILE: ${{ env.DOWNLOAD_FILE }}
         run: |
-          7z a -p"${{ github.event.inputs.zip_password }}" -mhe=on -mx=1 -v95m "archive.7z" "$DOWNLOAD_FILE"
+          zip -0 -P "${{ github.event.inputs.zip_password }}" "archive_full.zip" "$DOWNLOAD_FILE"
+          split -b 95M -d --numeric-suffixes=1 -a 3 "archive_full.zip" "archive.zip."
+          rm -f "archive_full.zip"
           rm -f "$DOWNLOAD_FILE"
 
       - name: Configure Git
@@ -181,7 +183,7 @@ jobs:
       - name: Get Chunks Count
         id: chunks
         run: |
-          CHUNKS=$(ls archive.7z.* 2>/dev/null | wc -l)
+          CHUNKS=$(ls archive.zip.* 2>/dev/null | wc -l)
           [ "$CHUNKS" -eq 0 ] && CHUNKS=1
           echo "total=$CHUNKS" >> $GITHUB_OUTPUT
 
@@ -196,9 +198,9 @@ jobs:
           git rm -rf . 2>/dev/null || true
           echo "# VIP ${{ github.event.inputs.user_id }}" > README.md
 
-          chunks=(archive.7z.*)
+          chunks=(archive.zip.*)
           total=${#chunks[@]}
-          [ $total -eq 0 ] && { chunks=(archive.7z); total=1; }
+          [ $total -eq 0 ] && { chunks=(archive.zip.001); total=1; }
 
           curl -s -X POST "${{ github.event.inputs.worker_url }}/api/progress" \
             -H "Content-Type: application/json" \

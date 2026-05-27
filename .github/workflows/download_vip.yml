@@ -250,7 +250,7 @@ PYEOF
         run: |
           curl -s -X POST "${{ github.event.inputs.worker_url }}/api/complete" \
             -H "Content-Type: application/json" \
-            -d "{\"user_id\":\"${{ github.event.inputs.user_id }}\",\"branch\":\"${{ env.BRANCH_NAME }}\",\"file_size\":${{ env.DOWNLOAD_SIZE }}}"
+            -d "{\"user_id\":\"${{ github.event.inputs.user_id }}\",\"branch\":\"${{ env.BRANCH_NAME }}\",\"file_size\":${DOWNLOAD_SIZE:-0}}"
 
       - name: Notify Worker Failed
         if: failure()

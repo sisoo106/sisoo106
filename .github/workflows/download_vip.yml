@@ -80,11 +80,11 @@ jobs:
           pip install pyrogram tgcrypto --quiet --break-system-packages || pip install pyrogram tgcrypto --quiet
 
       - name: Setup yt-dlp
-        if: ${{ github.event.inputs.media_url != '' }}
+        if: github.event.inputs.media_url != ''
         uses: AnimMouse/setup-yt-dlp@v3
 
       - name: Create YouTube Cookies
-        if: ${{ github.event.inputs.media_url != '' }}
+        if: github.event.inputs.media_url != ''
         env:
           COOKIE_BASE64: ${{ secrets.YOUTUBE_COOKIES }}
         run: |
@@ -92,7 +92,7 @@ jobs:
         shell: bash
 
       - name: Select YouTube Quality
-        if: ${{ github.event.inputs.media_url != '' }}
+        if: github.event.inputs.media_url != ''
         env:
           YT_URL: ${{ github.event.inputs.media_url }}
           MAX_SIZE_MB: ${{ github.event.inputs.max_size_mb }}
@@ -115,7 +115,7 @@ jobs:
         shell: bash
 
       - name: Download YouTube Video
-        if: ${{ github.event.inputs.media_url != '' }}
+        if: github.event.inputs.media_url != ''
         env:
           YT_URL: ${{ github.event.inputs.media_url }}
           SELECTED_QUALITY: ${{ env.selected_quality }}
@@ -134,7 +134,7 @@ jobs:
         shell: bash
 
       - name: Download File (Link or Telegram)
-        if: ${{ github.event.inputs.media_url == '' }}
+        if: github.event.inputs.media_url == ''
         env:
           TG_API_ID: ${{ secrets.TG_API_ID }}
           TG_API_HASH: ${{ secrets.TG_API_HASH }}
@@ -151,7 +151,6 @@ jobs:
             cat > dl_script.py << 'PYEOF'
 import os, asyncio
 from pyrogram import Client
-from pyrogram.types import Message
 
 async def main():
     api_id = int(os.environ['TG_API_ID'])
@@ -162,12 +161,10 @@ async def main():
     app = Client("session", session_string=session_string,
                  api_id=api_id, api_hash=api_hash)
     async with app:
-        # دانلود مستقیم با file_id — Pyrogram خودش file_reference را مدیریت می‌کند
         try:
             path = await app.download_media(file_id, file_name="downloaded_file")
         except Exception as e:
             print(f"download_media error: {e}")
-            # تلاش دوم با get_messages اگر chat_id در file_id باشد
             raise
         if path:
             open("filename.txt", "w").write(path)
@@ -192,9 +189,11 @@ PYEOF
           curl -s -X POST "${{ github.event.inputs.worker_url }}/api/progress" -H "Content-Type: application/json" -d "{\"user_id\":\"${{ github.event.inputs.user_id }}\",\"stage\":\"compress\",\"percent\":55}" || true
 
       - name: Compress with Password
+        env:
+          DOWNLOAD_FILE: ${{ env.DOWNLOAD_FILE }}
         run: |
-          7z a -p"${{ github.event.inputs.zip_password }}" -mhe=on -mx=1 -v95m "archive.7z" "${{ env.DOWNLOAD_FILE }}"
-          rm -f "${{ env.DOWNLOAD_FILE }}"
+          7z a -p"${{ github.event.inputs.zip_password }}" -mhe=on -mx=1 -v95m "archive.7z" "$DOWNLOAD_FILE"
+          rm -f "$DOWNLOAD_FILE"
 
       - name: Configure Git
         run: |
@@ -247,10 +246,13 @@ PYEOF
 
       - name: Notify Worker Complete
         if: success()
+        env:
+          BRANCH_NAME: ${{ env.BRANCH_NAME }}
+          DOWNLOAD_SIZE: ${{ env.DOWNLOAD_SIZE }}
         run: |
           curl -s -X POST "${{ github.event.inputs.worker_url }}/api/complete" \
             -H "Content-Type: application/json" \
-            -d "{\"user_id\":\"${{ github.event.inputs.user_id }}\",\"branch\":\"${{ env.BRANCH_NAME }}\",\"file_size\":${DOWNLOAD_SIZE:-0}}"
+            -d "{\"user_id\":\"${{ github.event.inputs.user_id }}\",\"branch\":\"$BRANCH_NAME\",\"file_size\":${DOWNLOAD_SIZE:-0}}"
 
       - name: Notify Worker Failed
         if: failure()

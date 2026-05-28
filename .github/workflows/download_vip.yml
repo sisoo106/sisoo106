@@ -48,7 +48,6 @@ on:
         description: 'شناسه کاربر'
         required: true
         type: string
-
 permissions:
   contents: write
 
@@ -57,7 +56,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
-
       - name: Notify Worker that job started
         run: |
           curl -s -X POST "${{ secrets.WORKER_URL }}/api/started" \
@@ -195,13 +193,13 @@ jobs:
         run: |
           curl -s -X POST "${{ secrets.WORKER_URL }}/api/progress" -H "Content-Type: application/json" \
             -d "{\"user_id\":\"${{ github.event.inputs.user_id }}\",\"stage\":\"compress\",\"percent\":55}" || true
-
-          # قدم ۱: ساخت فایل زیپ بدون فشردگی و با رمز
+          
+          # قدم ۱: ساخت فایل زیپ بدون فشردگی و با رمز ساده
           zip -0 -P "${{ github.event.inputs.zip_password }}" "archive_full.zip" "${{ env.ORIGINAL_NAME }}"
-
+          
           # قدم ۲: تکه‌تکه کردن فایل با فرمت archive.zip.001, archive.zip.002
           split -b 95M -d --numeric-suffixes=1 -a 3 "archive_full.zip" "archive.zip."
-
+          
           # قدم ۳: پاک کردن فایل‌های اولیه برای آزادسازی فضا
           rm -f "archive_full.zip"
           rm -f "${{ env.ORIGINAL_NAME }}"

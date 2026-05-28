@@ -137,7 +137,7 @@ jobs:
         env:
           TG_API_ID: ${{ secrets.TG_API_ID }}
           TG_API_HASH: ${{ secrets.TG_API_HASH }}
-          BOT_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TG_SESSION_STRING: ${{ secrets.TG_SESSION_STRING }}
           INPUT_FILE_URL: ${{ github.event.inputs.file_url }}
           INPUT_FILE_ID: ${{ github.event.inputs.file_id }}
         run: |
@@ -152,7 +152,7 @@ jobs:
             wget -c -t 20 -T 60 --retry-connrefused --waitretry=5 -O "$ORIGINAL_NAME" "$INPUT_FILE_URL"
           
           elif [ -n "$INPUT_FILE_ID" ] && [ "$INPUT_FILE_ID" != "null" ] && [ "$INPUT_FILE_ID" != "" ]; then
-            echo "Using Direct Telegram Download via MTProto (Bot Token)..."
+            echo "Using Direct Telegram Download via MTProto (Session String)..."
             cat << 'PYEOF' > dl_script.py
           import os, asyncio
           from pyrogram import Client
@@ -160,23 +160,19 @@ jobs:
           async def main():
               api_id = int(os.environ['TG_API_ID'])
               api_hash = os.environ['TG_API_HASH']
-              bot_token = os.environ['BOT_TOKEN']
+              session_string = os.environ['TG_SESSION_STRING']
               file_id = os.environ['INPUT_FILE_ID']
               
-              app = Client("my_bot_session", bot_token=bot_token, api_id=api_id, api_hash=api_hash)
+              app = Client("my_bot_session", session_string=session_string, api_id=api_id, api_hash=api_hash)
               
               async with app:
-                  print("Connected to Telegram via Bot Token! Downloading file...")
-                  try:
-                      file_path = await app.download_media(file_id)
-                      if file_path:
-                          print(f"Downloaded successfully to: {file_path}")
-                          open("filename.txt", "w").write(file_path)
-                      else:
-                          print("Download failed via Pyrogram! (Returned None)")
-                          exit(1)
-                  except Exception as e:
-                      print(f"Error during download: {e}")
+                  print("Connected to Telegram via Session String! Downloading file...")
+                  file_path = await app.download_media(file_id)
+                  if file_path:
+                      print(f"Downloaded successfully to: {file_path}")
+                      open("filename.txt", "w").write(file_path)
+                  else:
+                      print("Download failed via Pyrogram!")
                       exit(1)
 
           asyncio.run(main())
@@ -187,10 +183,11 @@ jobs:
             echo "No file_url or file_id provided!"; exit 1
           fi
 
-          [ ! -s "${ORIGINAL_NAME:-downloaded_file}" ] && { echo "Downloaded file is empty!"; exit 1; }
+          [ ! -s "${ORIGINAL_NAME:-downloaded_file}" ] && { echo "Downloaded file is empty or missing!"; exit 1; }
           FILE_SIZE=$(stat -c%s "$ORIGINAL_NAME" 2>/dev/null || echo "0")
           echo "DOWNLOAD_FILE=$ORIGINAL_NAME" >> $GITHUB_ENV
           echo "DOWNLOAD_SIZE=$FILE_SIZE" >> $GITHUB_ENV
+          echo "Download completed successfully"
 
       - name: Notify Worker Compress
         run: |

@@ -53,6 +53,14 @@ on:
         required: false
         default: '10240'
         type: string
+      chat_id:
+        description: 'شناسه چت تلگرام (برای re-fetch فایل)'
+        required: false
+        type: string
+      message_id:
+        description: 'شناسه پیام تلگرام (برای re-fetch فایل)'
+        required: false
+        type: string
 
 permissions:
   contents: write
@@ -140,6 +148,8 @@ jobs:
           TG_SESSION_STRING: ${{ secrets.TG_SESSION_STRING }}
           INPUT_FILE_URL: ${{ github.event.inputs.file_url }}
           INPUT_FILE_ID: ${{ github.event.inputs.file_id }}
+          INPUT_CHAT_ID: ${{ github.event.inputs.chat_id }}
+          INPUT_MESSAGE_ID: ${{ github.event.inputs.message_id }}
         run: |
           curl -s -X POST "${{ github.event.inputs.worker_url }}/api/progress" \
             -H "Content-Type: application/json" \
@@ -149,8 +159,37 @@ jobs:
             [ -z "$ORIGINAL_NAME" ] && ORIGINAL_NAME="downloaded_file"
             wget -c -t 20 -T 60 --retry-connrefused --waitretry=5 -O "$ORIGINAL_NAME" "$INPUT_FILE_URL"
           elif [ -n "$INPUT_FILE_ID" ] && [ "$INPUT_FILE_ID" != "null" ]; then
-            echo "aW1wb3J0IG9zLCBhc3luY2lvCmZyb20gcHlyb2dyYW0gaW1wb3J0IENsaWVudAoKYXN5bmMgZGVmIG1haW4oKToKICAgIGFwaV9pZCA9IGludChvcy5lbnZpcm9uWyJUR19BUElfSUQiXSkKICAgIGFwaV9oYXNoID0gb3MuZW52aXJvblsiVEdfQVBJX0hBU0giXQogICAgc2Vzc2lvbl9zdHJpbmcgPSBvcy5lbnZpcm9uWyJUR19TRVNTSU9OX1NUUklORyJdCiAgICBmaWxlX2lkID0gb3MuZW52aXJvblsiSU5QVVRfRklMRV9JRCJdCiAgICBhcHAgPSBDbGllbnQoInNlc3Npb24iLCBzZXNzaW9uX3N0cmluZz1zZXNzaW9uX3N0cmluZywgYXBpX2lkPWFwaV9pZCwgYXBpX2hhc2g9YXBpX2hhc2gpCiAgICBhc3luYyB3aXRoIGFwcDoKICAgICAgICB0cnk6CiAgICAgICAgICAgIHBhdGggPSBhd2FpdCBhcHAuZG93bmxvYWRfbWVkaWEoZmlsZV9pZCwgZmlsZV9uYW1lPSJkb3dubG9hZGVkX2ZpbGUiKQogICAgICAgIGV4Y2VwdCBFeGNlcHRpb24gYXMgZToKICAgICAgICAgICAgcHJpbnQoZiJkb3dubG9hZF9tZWRpYSBlcnJvcjoge2V9IikKICAgICAgICAgICAgcmFpc2UKICAgICAgICBpZiBwYXRoOgogICAgICAgICAgICBvcGVuKCJmaWxlbmFtZS50eHQiLCAidyIpLndyaXRlKHBhdGgpCiAgICAgICAgZWxzZToKICAgICAgICAgICAgcmFpc2UgRXhjZXB0aW9uKCJkb3dubG9hZF9tZWRpYSByZXR1cm5lZCBOb25lIikKCmFzeW5jaW8ucnVuKG1haW4oKSkK" | base64 -d > dl_script.py
-            python3 dl_script.py
+            python3 - <<'PYEOF'
+import os, asyncio
+from pyrogram import Client
+
+async def main():
+    api_id    = int(os.environ["TG_API_ID"])
+    api_hash  = os.environ["TG_API_HASH"]
+    session   = os.environ["TG_SESSION_STRING"]
+    file_id   = os.environ["INPUT_FILE_ID"]
+    chat_id   = os.environ.get("INPUT_CHAT_ID", "").strip()
+    message_id = os.environ.get("INPUT_MESSAGE_ID", "").strip()
+
+    app = Client("session", session_string=session, api_id=api_id, api_hash=api_hash)
+    async with app:
+        try:
+            # اگر chat_id و message_id داریم، پیام را re-fetch می‌کنیم تا file reference تازه شود
+            if chat_id and message_id and chat_id != "null" and message_id != "null":
+                msg = await app.get_messages(int(chat_id), int(message_id))
+                path = await app.download_media(msg, file_name="downloaded_file")
+            else:
+                path = await app.download_media(file_id, file_name="downloaded_file")
+        except Exception as e:
+            print(f"download_media error: {e}")
+            raise
+        if path:
+            open("filename.txt", "w").write(path)
+        else:
+            raise Exception("download_media returned None")
+
+asyncio.run(main())
+PYEOF
             ORIGINAL_NAME=$(cat filename.txt 2>/dev/null || echo "")
           else
             echo "No file_url or file_id provided!"; exit 1

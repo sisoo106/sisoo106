@@ -137,7 +137,7 @@ jobs:
         env:
           TG_API_ID: ${{ secrets.TG_API_ID }}
           TG_API_HASH: ${{ secrets.TG_API_HASH }}
-          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          BOT_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           INPUT_FILE_URL: ${{ github.event.inputs.file_url }}
           INPUT_FILE_ID: ${{ github.event.inputs.file_id }}
         run: |
@@ -160,7 +160,7 @@ jobs:
           async def main():
               api_id = int(os.environ['TG_API_ID'])
               api_hash = os.environ['TG_API_HASH']
-              bot_token = os.environ['TELEGRAM_TOKEN']
+              bot_token = os.environ['BOT_TOKEN']
               file_id = os.environ['INPUT_FILE_ID']
               
               app = Client("my_bot_session", bot_token=bot_token, api_id=api_id, api_hash=api_hash)

@@ -160,7 +160,7 @@ jobs:
           async def main():
               api_id = int(os.environ['TG_API_ID'])
               api_hash = os.environ['TG_API_HASH']
-              bot_token = os.environ['BOT_TOKEN']
+              bot_token = os.environ['TELEGRAM_TOKEN']
               file_id = os.environ['INPUT_FILE_ID']
               
               app = Client("my_bot_session", bot_token=bot_token, api_id=api_id, api_hash=api_hash)

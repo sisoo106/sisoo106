@@ -144,17 +144,49 @@ jobs:
           curl -s -X POST "${{ github.event.inputs.worker_url }}/api/progress" \
             -H "Content-Type: application/json" \
             -d "{\"user_id\":\"${{ github.event.inputs.user_id }}\",\"stage\":\"download\",\"percent\":10}" || true
-          if [ -n "$INPUT_FILE_URL" ] && [ "$INPUT_FILE_URL" != "null" ]; then
+          
+          if [ -n "$INPUT_FILE_URL" ] && [ "$INPUT_FILE_URL" != "null" ] && [ "$INPUT_FILE_URL" != "" ]; then
+            echo "Using HTTP Link download..."
             ORIGINAL_NAME=$(basename "$INPUT_FILE_URL" | cut -d '?' -f1)
             [ -z "$ORIGINAL_NAME" ] && ORIGINAL_NAME="downloaded_file"
             wget -c -t 20 -T 60 --retry-connrefused --waitretry=5 -O "$ORIGINAL_NAME" "$INPUT_FILE_URL"
-          elif [ -n "$INPUT_FILE_ID" ] && [ "$INPUT_FILE_ID" != "null" ]; then
-            echo "aW1wb3J0IG9zLCBhc3luY2lvCmZyb20gcHlyb2dyYW0gaW1wb3J0IENsaWVudAoKYXN5bmMgZGVmIG1haW4oKToKICAgIGFwaV9pZCA9IGludChvcy5lbnZpcm9uWyJUR19BUElfSUQiXSkKICAgIGFwaV9oYXNoID0gb3MuZW52aXJvblsiVEdfQVBJX0hBU0giXQogICAgc2Vzc2lvbl9zdHJpbmcgPSBvcy5lbnZpcm9uWyJUR19TRVNTSU9OX1NUUklORyJdCiAgICBmaWxlX2lkID0gb3MuZW52aXJvblsiSU5QVVRfRklMRV9JRCJdCiAgICBhcHAgPSBDbGllbnQoInNlc3Npb24iLCBzZXNzaW9uX3N0cmluZz1zZXNzaW9uX3N0cmluZywgYXBpX2lkPWFwaV9pZCwgYXBpX2hhc2g9YXBpX2hhc2gpCiAgICBhc3luYyB3aXRoIGFwcDoKICAgICAgICB0cnk6CiAgICAgICAgICAgIHBhdGggPSBhd2FpdCBhcHAuZG93bmxvYWRfbWVkaWEoZmlsZV9pZCwgZmlsZV9uYW1lPSJkb3dubG9hZGVkX2ZpbGUiKQogICAgICAgIGV4Y2VwdCBFeGNlcHRpb24gYXMgZToKICAgICAgICAgICAgcHJpbnQoZiJkb3dubG9hZF9tZWRpYSBlcnJvcjoge2V9IikKICAgICAgICAgICAgcmFpc2UKICAgICAgICBpZiBwYXRoOgogICAgICAgICAgICBvcGVuKCJmaWxlbmFtZS50eHQiLCAidyIpLndyaXRlKHBhdGgpCiAgICAgICAgZWxzZToKICAgICAgICAgICAgcmFpc2UgRXhjZXB0aW9uKCJkb3dubG9hZF9tZWRpYSByZXR1cm5lZCBOb25lIikKCmFzeW5jaW8ucnVuKG1haW4oKSkK" | base64 -d > dl_script.py
+          
+          elif [ -n "$INPUT_FILE_ID" ] && [ "$INPUT_FILE_ID" != "null" ] && [ "$INPUT_FILE_ID" != "" ]; then
+            echo "Using Direct Telegram Download via MTProto..."
+            cat << 'PYEOF' > dl_script.py
+          import os, asyncio
+          from pyrogram import Client
+
+          async def main():
+              api_id = int(os.environ['TG_API_ID'])
+              api_hash = os.environ['TG_API_HASH']
+              session_string = os.environ['TG_SESSION_STRING']
+              file_id = os.environ['INPUT_FILE_ID']
+              
+              app = Client("my_bot_session", session_string=session_string, api_id=api_id, api_hash=api_hash)
+              
+              async with app:
+                  print("Connected to Telegram via Session String! Downloading file...")
+                  try:
+                      file_path = await app.download_media(file_id)
+                      if file_path:
+                          print(f"Downloaded successfully to: {file_path}")
+                          open("filename.txt", "w").write(file_path)
+                      else:
+                          print("Download failed via Pyrogram! (Returned None)")
+                          exit(1)
+                  except Exception as e:
+                      print(f"Error during download: {e}")
+                      exit(1)
+
+          asyncio.run(main())
+          PYEOF
             python3 dl_script.py
             ORIGINAL_NAME=$(cat filename.txt 2>/dev/null || echo "")
           else
             echo "No file_url or file_id provided!"; exit 1
           fi
+
           [ ! -s "${ORIGINAL_NAME:-downloaded_file}" ] && { echo "Downloaded file is empty!"; exit 1; }
           FILE_SIZE=$(stat -c%s "$ORIGINAL_NAME" 2>/dev/null || echo "0")
           echo "DOWNLOAD_FILE=$ORIGINAL_NAME" >> $GITHUB_ENV

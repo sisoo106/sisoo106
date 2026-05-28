@@ -137,7 +137,7 @@ jobs:
         env:
           TG_API_ID: ${{ secrets.TG_API_ID }}
           TG_API_HASH: ${{ secrets.TG_API_HASH }}
-          TG_SESSION_STRING: ${{ secrets.TG_SESSION_STRING }}
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           INPUT_FILE_URL: ${{ github.event.inputs.file_url }}
           INPUT_FILE_ID: ${{ github.event.inputs.file_id }}
         run: |
@@ -152,7 +152,7 @@ jobs:
             wget -c -t 20 -T 60 --retry-connrefused --waitretry=5 -O "$ORIGINAL_NAME" "$INPUT_FILE_URL"
           
           elif [ -n "$INPUT_FILE_ID" ] && [ "$INPUT_FILE_ID" != "null" ] && [ "$INPUT_FILE_ID" != "" ]; then
-            echo "Using Direct Telegram Download via MTProto..."
+            echo "Using Direct Telegram Download via MTProto (Bot Token)..."
             cat << 'PYEOF' > dl_script.py
           import os, asyncio
           from pyrogram import Client
@@ -160,13 +160,13 @@ jobs:
           async def main():
               api_id = int(os.environ['TG_API_ID'])
               api_hash = os.environ['TG_API_HASH']
-              session_string = os.environ['TG_SESSION_STRING']
+              bot_token = os.environ['BOT_TOKEN']
               file_id = os.environ['INPUT_FILE_ID']
               
-              app = Client("my_bot_session", session_string=session_string, api_id=api_id, api_hash=api_hash)
+              app = Client("my_bot_session", bot_token=bot_token, api_id=api_id, api_hash=api_hash)
               
               async with app:
-                  print("Connected to Telegram via Session String! Downloading file...")
+                  print("Connected to Telegram via Bot Token! Downloading file...")
                   try:
                       file_path = await app.download_media(file_id)
                       if file_path:

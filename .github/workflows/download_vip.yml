@@ -137,9 +137,10 @@ jobs:
         env:
           TG_API_ID: ${{ secrets.TG_API_ID }}
           TG_API_HASH: ${{ secrets.TG_API_HASH }}
-          TG_SESSION_STRING: ${{ secrets.TG_SESSION_STRING }}
+          BOT_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           INPUT_FILE_URL: ${{ github.event.inputs.file_url }}
           INPUT_FILE_ID: ${{ github.event.inputs.file_id }}
+          USER_ID: ${{ github.event.inputs.user_id }}
         run: |
           curl -s -X POST "${{ github.event.inputs.worker_url }}/api/progress" \
             -H "Content-Type: application/json" \
@@ -152,7 +153,7 @@ jobs:
             wget -c -t 20 -T 60 --retry-connrefused --waitretry=5 -O "$ORIGINAL_NAME" "$INPUT_FILE_URL"
           
           elif [ -n "$INPUT_FILE_ID" ] && [ "$INPUT_FILE_ID" != "null" ] && [ "$INPUT_FILE_ID" != "" ]; then
-            echo "Using Direct Telegram Download via MTProto (Session String)..."
+            echo "Using Direct Telegram Download via MTProto (Smart Bot Token)..."
             cat << 'PYEOF' > dl_script.py
           import os, asyncio
           from pyrogram import Client
@@ -160,19 +161,34 @@ jobs:
           async def main():
               api_id = int(os.environ['TG_API_ID'])
               api_hash = os.environ['TG_API_HASH']
-              session_string = os.environ['TG_SESSION_STRING']
+              bot_token = os.environ['BOT_TOKEN']
+              chat_id = int(os.environ['USER_ID'])
               file_id = os.environ['INPUT_FILE_ID']
               
-              app = Client("my_bot_session", session_string=session_string, api_id=api_id, api_hash=api_hash)
+              app = Client("my_bot_session", bot_token=bot_token, api_id=api_id, api_hash=api_hash)
               
               async with app:
-                  print("Connected to Telegram via Session String! Downloading file...")
-                  file_path = await app.download_media(file_id)
+                  print(f"Connected to Telegram via Bot Token! Resolving file for User {chat_id}...")
+                  file_path = None
+                  try:
+                      # قدم اول: سعی میکنه عادی دانلود کنه
+                      print("Attempt 1: Direct file_id download...")
+                      file_path = await app.download_media(file_id)
+                  except Exception as e:
+                      # قدم دوم: اگه رفرنس منقضی بود، میره تو چت آخرین فایل رو پیدا میکنه
+                      print(f"Direct download failed: {e}")
+                      print("Attempt 2: Fetching message from chat history to get fresh file reference...")
+                      async for msg in app.get_chat_history(chat_id, limit=10):
+                          if msg.document or msg.video or msg.audio or msg.photo:
+                              print(f"Found the media message! Getting fresh reference and downloading...")
+                              file_path = await app.download_media(msg)
+                              break
+                  
                   if file_path:
                       print(f"Downloaded successfully to: {file_path}")
                       open("filename.txt", "w").write(file_path)
                   else:
-                      print("Download failed via Pyrogram!")
+                      print("Download failed completely!")
                       exit(1)
 
           asyncio.run(main())

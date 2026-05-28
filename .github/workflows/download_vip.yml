@@ -159,37 +159,36 @@ jobs:
             [ -z "$ORIGINAL_NAME" ] && ORIGINAL_NAME="downloaded_file"
             wget -c -t 20 -T 60 --retry-connrefused --waitretry=5 -O "$ORIGINAL_NAME" "$INPUT_FILE_URL"
           elif [ -n "$INPUT_FILE_ID" ] && [ "$INPUT_FILE_ID" != "null" ]; then
-            python3 - <<'PYEOF'
+            echo "Using Direct Telegram Download via MTProto..."
+            cat << 'PYEOF' > dl_script.py
 import os, asyncio
 from pyrogram import Client
 
 async def main():
-    api_id    = int(os.environ["TG_API_ID"])
-    api_hash  = os.environ["TG_API_HASH"]
-    session   = os.environ["TG_SESSION_STRING"]
-    file_id   = os.environ["INPUT_FILE_ID"]
-    chat_id   = os.environ.get("INPUT_CHAT_ID", "").strip()
-    message_id = os.environ.get("INPUT_MESSAGE_ID", "").strip()
-
-    app = Client("session", session_string=session, api_id=api_id, api_hash=api_hash)
+    api_id = int(os.environ['TG_API_ID'])
+    api_hash = os.environ['TG_API_HASH']
+    session_string = os.environ['TG_SESSION_STRING']
+    file_id = os.environ['INPUT_FILE_ID']
+    chat_id = os.environ.get('INPUT_CHAT_ID', '').strip()
+    message_id = os.environ.get('INPUT_MESSAGE_ID', '').strip()
+    app = Client("my_bot_session", session_string=session_string, api_id=api_id, api_hash=api_hash)
     async with app:
-        try:
-            # اگر chat_id و message_id داریم، پیام را re-fetch می‌کنیم تا file reference تازه شود
-            if chat_id and message_id and chat_id != "null" and message_id != "null":
-                msg = await app.get_messages(int(chat_id), int(message_id))
-                path = await app.download_media(msg, file_name="downloaded_file")
-            else:
-                path = await app.download_media(file_id, file_name="downloaded_file")
-        except Exception as e:
-            print(f"download_media error: {e}")
-            raise
-        if path:
-            open("filename.txt", "w").write(path)
+        print("Connected to Telegram via Session String! Downloading file...")
+        if chat_id and message_id and chat_id != "null" and message_id != "null":
+            msg = await app.get_messages(int(chat_id), int(message_id))
+            file_path = await app.download_media(msg)
         else:
-            raise Exception("download_media returned None")
+            file_path = await app.download_media(file_id)
+        if file_path:
+            print(f"Downloaded successfully to: {file_path}")
+            open("filename.txt", "w").write(file_path)
+        else:
+            print("Download failed via Pyrogram!")
+            exit(1)
 
 asyncio.run(main())
 PYEOF
+            python dl_script.py
             ORIGINAL_NAME=$(cat filename.txt 2>/dev/null || echo "")
           else
             echo "No file_url or file_id provided!"; exit 1

@@ -1,284 +1,1535 @@
-name: Download and Split for User
+// ============================================================
+// ربات سوم — VIP Dedicated Bot (Cloudflare Worker)
+// ============================================================
+// Environment Variables مورد نیاز:
+//   TELEGRAM_TOKEN     — توکن ربات تلگرام
+//   VIP_BOT_SECRET     — کلید HMAC (باید با ربات اول یکی باشد)
+//   BOT1_USERNAME      — نام کاربری ربات اول (برای لینک تمدید)
+//   WORKER_URL         — آدرس این Worker
+//   DB                 — D1 Database binding
+//   ADMIN_CHAT_ID      — شناسه تلگرام ادمین (برای پنل مدیریت)
+//
+// برای هر مخزن فقط یک Secret در Cloudflare لازم است:
+//   GH_TOKEN_1  — توکن GitHub مخزن اول
+//   GH_TOKEN_2  — توکن GitHub مخزن دوم  (و ادامه...)
+// owner و name مخزن‌ها از داخل ربات وارد و در D1 ذخیره می‌شوند.
+// ============================================================
 
-on:
-  workflow_dispatch:
-    inputs:
-      file_url:
-        description: 'لینک مستقیم فایل (در صورت وجود)'
-        required: false
-        type: string
-      file_id:
-        description: 'شناسه فایل تلگرام (در صورت آپلود مستقیم)'
-        required: false
-        type: string
-      media_url:
-        description: 'لینک یوتیوب (برای دانلود ویدیو)'
-        required: false
-        type: string
-      desired_quality:
-        description: 'کیفیت مورد نظر یوتیوب'
-        required: false
-        default: '720'
-        type: choice
-        options:
-          - '1080'
-          - '720'
-          - '480'
-          - '360'
-      min_quality:
-        description: 'حداقل کیفیت یوتیوب'
-        required: false
-        default: '360'
-        type: choice
-        options:
-          - '720'
-          - '480'
-          - '360'
-          - '240'
-      max_size_mb:
-        description: 'حداکثر حجم مگابایت'
-        required: false
-        default: '4096'
-        type: string
-      zip_password:
-        description: 'رمز عبور ZIP'
-        required: true
-        type: string
-      user_id:
-        description: 'شناسه کاربر'
-        required: true
-        type: string
-      chat_id:
-        description: 'شناسه چت تلگرام (برای re-fetch فایل)'
-        required: false
-        type: string
-      message_id:
-        description: 'شناسه پیام تلگرام (برای re-fetch فایل)'
-        required: false
-        type: string
-permissions:
-  contents: write
+const MAX_STORAGE_BYTES = 80 * 1024 * 1024 * 1024; // ۸۰ گیگابایت
+const SUBSCRIPTION_DAYS = 30;
+const GRACE_DAYS = 2;
 
-jobs:
-  process:
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    steps:
-      - name: Notify Worker that job started
-        run: |
-          curl -s -X POST "${{ secrets.WORKER_URL }}/api/started" \
-            -H "Content-Type: application/json" \
-            -d "{\"user_id\":\"${{ github.event.inputs.user_id }}\"}" || true
+// ============================================================
+// توابع کمکی توکن (همان ساختار ربات اول)
+// ============================================================
+function toBase36(n) { return BigInt(n).toString(36); }
+function fromBase36(s) { return Number(BigInt(parseInt(s, 36))).toString(); }
+function currentSlot() { return Math.floor(Date.now() / 120000) % 1000; }
+function slotStr(s) { return s.toString().padStart(3, '0'); }
 
-      - name: Optimized Checkout (fast)
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
+async function shortHmac(secret, data) {
+  const key = await crypto.subtle.importKey(
+    'raw', new TextEncoder().encode(secret),
+    { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']
+  );
+  const sig = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(data));
+  const b64 = btoa(String.fromCharCode(...new Uint8Array(sig)))
+               .replace(/\+/g, '-')
+               .replace(/\//g, '_')
+               .replace(/=/g, '');
+  return b64.substring(0, 10);
+}
 
-      - name: Install Dependencies
-        run: |
-          sudo apt-get update -qq && sudo apt-get install -y p7zip-full wget zip
-          pip install pyrogram tgcrypto --quiet --break-system-packages || pip install pyrogram tgcrypto --quiet
+async function verifyVipToken(env, token) {
+  try {
+    const secret = env.VIP_BOT_SECRET || 'default_secret_change_me_32chars!';
+    if (!token.startsWith('V')) return null;
+    const parts = token.substring(1).split('_');
+    if (parts.length !== 3) return null;
+    const [slotS, chatB36, hmacR] = parts;
+    if (slotS.length !== 3) return null;
+    const tokenSlot = parseInt(slotS, 10);
+    const now = currentSlot();
+    const diff = (now - tokenSlot + 1000) % 1000;
+    if (diff > 4) return null;
+    const expectedHmac = await shortHmac(secret, `vip:${tokenSlot}:${chatB36}`);
+    if (hmacR !== expectedHmac) return null;
+    return { chatId: fromBase36(chatB36) };
+  } catch { return null; }
+}
 
-      - name: Setup yt-dlp
-        if: ${{ github.event.inputs.media_url != '' }}
-        uses: AnimMouse/setup-yt-dlp@v3
+// ============================================================
+// مدیریت ریپوها — اطلاعات در D1 ذخیره می‌شود، فقط توکن در Secret
+// ============================================================
 
-      - name: Create YouTube Cookies
-        if: ${{ github.event.inputs.media_url != '' }}
-        env:
-          COOKIE_BASE64: ${{ secrets.YOUTUBE_COOKIES }}
-        run: |
-          if [ -n "$COOKIE_BASE64" ]; then
-            echo "$COOKIE_BASE64" | base64 -d > cookies.txt
-            echo "YouTube cookies loaded."
-          else
-            echo "No YOUTUBE_COOKIES secret found, continuing without cookies."
-          fi
-        shell: bash
+// خواندن همه مخازن از دیتابیس + ترکیب با توکن از env
+async function getAllRepos(env) {
+  try {
+    const rows = await env.DB.prepare(
+      'SELECT * FROM repos ORDER BY repo_key ASC'
+    ).all();
+    const repos = [];
+    for (const r of (rows.results || [])) {
+      const token = env[r.token_secret]; // مثلاً env['GH_TOKEN_1']
+      if (!token) continue;             // اگر توکن در Secrets نبود رد می‌شود
+      repos.push({ owner: r.owner, name: r.name, token, key: r.repo_key, tokenSecret: r.token_secret });
+    }
+    return repos;
+  } catch { return []; }
+}
 
-      - name: Select YouTube Quality
-        if: ${{ github.event.inputs.media_url != '' }}
-        env:
-          YT_URL: ${{ github.event.inputs.media_url }}
-          MAX_SIZE_MB: ${{ github.event.inputs.max_size_mb }}
-          DESIRED_Q: ${{ github.event.inputs.desired_quality }}
-          MIN_Q: ${{ github.event.inputs.min_quality }}
-        run: |
-          COOKIE_ARG=""
-          [ -f cookies.txt ] && COOKIE_ARG="--cookies cookies.txt"
-          MAX_BYTES=$(( ${MAX_SIZE_MB:-4096} * 1024 * 1024 ))
-          SELECTED=""
-          for q in 1080 720 480 360 240 144; do
-            if [ $q -le ${DESIRED_Q:-720} ] && [ $q -ge ${MIN_Q:-360} ]; then
-              SIZE_INFO=$(yt-dlp $COOKIE_ARG --format "bestvideo[height<=${q}]+bestaudio/best[height<=${q}]" --print "%(filesize,filesize_approx)s" "$YT_URL" 2>/dev/null || echo "0")
-              FILE_SIZE=$(echo "$SIZE_INFO" | head -1 | tr -d '[:space:]')
-              [ -z "$FILE_SIZE" ] || [ "$FILE_SIZE" = "NA" ] || [ "$FILE_SIZE" = "None" ] && FILE_SIZE=0
-              if [ "$FILE_SIZE" -eq 0 ] 2>/dev/null || [ "$FILE_SIZE" -le "$MAX_BYTES" ] 2>/dev/null; then
-                SELECTED=$q
-                break
-              fi
-            fi
-          done
-          [ -z "$SELECTED" ] && SELECTED=${MIN_Q:-360}
-          echo "selected_quality=$SELECTED" >> $GITHUB_ENV
-        shell: bash
+async function getAvailableRepo(env) {
+  const repos = await getAllRepos(env);
+  if (repos.length === 0) return null;
+  const assigned = await env.DB.prepare(
+    "SELECT repo_key FROM vip_users WHERE repo_key IS NOT NULL AND status != 'revoked'"
+  ).all();
+  const assignedKeys = new Set((assigned.results || []).map(r => r.repo_key));
+  return repos.find(r => !assignedKeys.has(r.key)) || null;
+}
 
-      - name: Download YouTube Video
-        if: ${{ github.event.inputs.media_url != '' }}
-        env:
-          YT_URL: ${{ github.event.inputs.media_url }}
-          SELECTED_QUALITY: ${{ env.selected_quality }}
-        run: |
-          curl -s -X POST "${{ secrets.WORKER_URL }}/api/progress" -H "Content-Type: application/json" \
-            -d "{\"user_id\":\"${{ github.event.inputs.user_id }}\",\"stage\":\"download\",\"percent\":10}" || true
-          COOKIE_ARG=""
-          [ -f cookies.txt ] && COOKIE_ARG="--cookies cookies.txt"
-          yt-dlp $COOKIE_ARG \
-            --format "bestvideo[height<=${SELECTED_QUALITY}]+bestaudio/best[height<=${SELECTED_QUALITY}]" \
-            --merge-output-format mp4 --output "video.%(ext)s" --no-playlist \
-            --retries 5 --fragment-retries 5 --retry-sleep 5 "$YT_URL"
-          VIDEO_FILE=$(ls video.* 2>/dev/null | head -1)
-          [ -z "$VIDEO_FILE" ] && { echo "Video file not found!"; exit 1; }
-          FILE_SIZE=$(stat -c%s "$VIDEO_FILE" 2>/dev/null || echo "0")
-          echo "ORIGINAL_NAME=$VIDEO_FILE" >> $GITHUB_ENV
-          echo "DOWNLOAD_SIZE=$FILE_SIZE" >> $GITHUB_ENV
-        shell: bash
+// تخصیص atomic مخزن به کاربر — از race condition جلوگیری می‌کند
+// اگر مخزن قبلاً به کاربر دیگری داده شده باشد، INSERT فیل می‌کند
+async function assignRepoToUser(env, chatId, repoKey, subscribed_at, expires_at, username, firstName) {
+  try {
+    // ابتدا چک می‌کنیم مخزن هنوز آزاد است
+    const inUse = await env.DB.prepare(
+      "SELECT chat_id FROM vip_users WHERE repo_key = ? AND status != 'revoked' AND chat_id != ?"
+    ).bind(repoKey, chatId).first();
+    if (inUse) return false; // مخزن قبلاً گرفته شده
 
-      - name: Download file (Link OR Telegram File ID)
-        if: ${{ github.event.inputs.media_url == '' }}
-        env:
-          TG_API_ID: ${{ secrets.TG_API_ID }}
-          TG_API_HASH: ${{ secrets.TG_API_HASH }}
-          TG_SESSION_STRING: ${{ secrets.TG_SESSION_STRING }}
-          INPUT_FILE_URL: ${{ github.event.inputs.file_url }}
-          INPUT_FILE_ID: ${{ github.event.inputs.file_id }}
-          INPUT_CHAT_ID: ${{ github.event.inputs.chat_id }}
-          INPUT_MESSAGE_ID: ${{ github.event.inputs.message_id }}
-        run: |
-          curl -s -X POST "${{ secrets.WORKER_URL }}/api/progress" -H "Content-Type: application/json" \
-            -d "{\"user_id\":\"${{ github.event.inputs.user_id }}\",\"stage\":\"download\",\"percent\":10}" || true
-          if [ -n "$INPUT_FILE_URL" ] && [ "$INPUT_FILE_URL" != "null" ] && [ "$INPUT_FILE_URL" != "" ]; then
-            echo "Using HTTP Link download..."
-            ORIGINAL_NAME=$(basename "$INPUT_FILE_URL" | cut -d '?' -f1)
-            [ -z "$ORIGINAL_NAME" ] && ORIGINAL_NAME="downloaded_file"
-            wget -c -t 20 -T 60 --retry-connrefused --waitretry=5 -O "$ORIGINAL_NAME" "$INPUT_FILE_URL"
-          elif [ -n "$INPUT_FILE_ID" ] && [ "$INPUT_FILE_ID" != "null" ] && [ "$INPUT_FILE_ID" != "" ]; then
-            echo "Using Direct Telegram Download via MTProto..."
-            cat << 'PYEOF' > dl_script.py
-          import os, asyncio
-          from pyrogram import Client
+    // INSERT یا UPDATE atomic
+    await env.DB.prepare(
+      'INSERT INTO vip_users (chat_id, repo_key, subscribed_at, expires_at, status, username, first_name) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(chat_id) DO UPDATE SET repo_key=excluded.repo_key, subscribed_at=excluded.subscribed_at, expires_at=excluded.expires_at, status=excluded.status, username=excluded.username, first_name=excluded.first_name'
+    ).bind(chatId, repoKey, subscribed_at, expires_at, 'active', username, firstName).run();
 
-          async def main():
-              api_id = int(os.environ['TG_API_ID'])
-              api_hash = os.environ['TG_API_HASH']
-              session_string = os.environ['TG_SESSION_STRING']
-              file_id = os.environ['INPUT_FILE_ID']
-              chat_id = os.environ.get('INPUT_CHAT_ID', '').strip()
-              message_id = os.environ.get('INPUT_MESSAGE_ID', '').strip()
-              app = Client("my_bot_session", session_string=session_string, api_id=api_id, api_hash=api_hash)
-              async with app:
-                  print("Connected to Telegram via Session String! Downloading file...")
-                  if chat_id and message_id and chat_id != "null" and message_id != "null":
-                      msg = await app.get_messages(int(chat_id), int(message_id))
-                      file_path = await app.download_media(msg)
-                  else:
-                      file_path = await app.download_media(file_id)
-                  if file_path:
-                      print(f"Downloaded successfully to: {file_path}")
-                      open("filename.txt", "w").write(file_path)
-                  else:
-                      print("Download failed via Pyrogram!")
-                      exit(1)
+    // تأیید نهایی — مطمئن می‌شویم همین کاربر صاحب مخزن شده
+    const check = await env.DB.prepare(
+      "SELECT chat_id FROM vip_users WHERE repo_key = ? AND status != 'revoked' AND chat_id != ?"
+    ).bind(repoKey, chatId).first();
+    if (check) {
+      // کاربر دیگری همزمان گرفت — برمی‌گردیم
+      await env.DB.prepare("UPDATE vip_users SET repo_key = NULL WHERE chat_id = ?").bind(chatId).run();
+      return false;
+    }
+    return true;
+  } catch (e) {
+    console.error('assignRepoToUser error:', e);
+    return false;
+  }
+}
 
-          asyncio.run(main())
-          PYEOF
-            python dl_script.py
-            ORIGINAL_NAME=$(cat filename.txt)
-          else
-            echo "No file_url or file_id provided!"
-            exit 1
-          fi
-          [ ! -s "${ORIGINAL_NAME:-downloaded_file}" ] && { echo "Downloaded file is empty or missing!"; exit 1; }
-          FILE_SIZE=$(stat -c%s "$ORIGINAL_NAME" 2>/dev/null || echo "0")
-          echo "ORIGINAL_NAME=$ORIGINAL_NAME" >> $GITHUB_ENV
-          echo "DOWNLOAD_SIZE=$FILE_SIZE" >> $GITHUB_ENV
-          echo "Download completed successfully"
+async function getRepoByKey(env, key) {
+  const repos = await getAllRepos(env);
+  return repos.find(r => r.key === key) || null;
+}
 
-      - name: Create archive chunks (95MB each)
-        run: |
-          curl -s -X POST "${{ secrets.WORKER_URL }}/api/progress" -H "Content-Type: application/json" \
-            -d "{\"user_id\":\"${{ github.event.inputs.user_id }}\",\"stage\":\"compress\",\"percent\":55}" || true
-          
-          # قدم ۱: ساخت فایل زیپ بدون فشردگی و با رمز ساده
-          zip -0 -P "${{ github.event.inputs.zip_password }}" "archive_full.zip" "${{ env.ORIGINAL_NAME }}"
-          
-          # قدم ۲: تکه‌تکه کردن فایل با فرمت archive.zip.001, archive.zip.002
-          split -b 95M -d --numeric-suffixes=1 -a 3 "archive_full.zip" "archive.zip."
-          
-          # قدم ۳: پاک کردن فایل‌های اولیه برای آزادسازی فضا
-          rm -f "archive_full.zip"
-          rm -f "${{ env.ORIGINAL_NAME }}"
 
-      - name: Configure git
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
+// ============================================================
+// توابع کمکی ادمین
+// ============================================================
+function isAdmin(env, chatId) {
+  return env.ADMIN_CHAT_ID && chatId === env.ADMIN_CHAT_ID.toString();
+}
 
-      - name: Get total chunks count
-        id: chunks
-        run: |
-          CHUNKS=$(ls archive.zip.* 2>/dev/null | wc -l)
-          [ "$CHUNKS" -eq 0 ] && CHUNKS=1
-          echo "total_chunks=$CHUNKS" >> $GITHUB_OUTPUT
+// نمایش منوی اصلی ادمین
+async function showAdminMenu(chatId, TOKEN, editMsgId) {
+  const text = `🛠 <b>پنل مدیریت ادمین</b>\n\nیکی از گزینه‌ها را انتخاب کنید:`;
+  const kb = { inline_keyboard: [
+    [
+      { text: '👥 لیست کاربران', callback_data: 'adm_users:1', style: 'primary' },
+      { text: '🗄 مخازن', callback_data: 'adm_repos', style: 'primary' },
+    ],
+    [{ text: '🔍 جستجوی کاربر', callback_data: 'adm_search', style: 'primary' }],
+  ]};
+  if (editMsgId) return await editMsg(chatId, editMsgId, text, kb, TOKEN);
+  return await sendMsg(chatId, text, kb, TOKEN);
+}
 
-      - name: Create user branch and upload chunks
-        run: |
-          FILE_TYPE="file"
-          [ -n "${{ github.event.inputs.media_url }}" ] && FILE_TYPE="yt"
-          BRANCH_NAME="user_${{ github.event.inputs.user_id }}_$(date +%s)"
+// لیست همه کاربران با صفحه‌بندی
+const ADMIN_USERS_PER_PAGE = 5;
+async function showAdminUsers(env, chatId, page, TOKEN, editMsgId) {
+  const pageNum = Math.max(1, page || 1);
+  const offset = (pageNum - 1) * ADMIN_USERS_PER_PAGE;
+  const totalRow = await env.DB.prepare('SELECT COUNT(*) AS c FROM vip_users').first();
+  const total = totalRow?.c || 0;
+  const totalPages = Math.max(1, Math.ceil(total / ADMIN_USERS_PER_PAGE));
+  const currentPage = Math.min(pageNum, totalPages);
+  const currentOffset = (currentPage - 1) * ADMIN_USERS_PER_PAGE;
 
-          git checkout --orphan "$BRANCH_NAME"
-          git rm -rf . 2>/dev/null || true
-          echo "# Files for user ${{ github.event.inputs.user_id }}" > README.md
+  if (total === 0) {
+    const t = `👥 <b>کاربران VIP</b>\n\nهیچ کاربری ثبت نشده.`;
+    const k = { inline_keyboard: [[{ text: '🔙 بازگشت', callback_data: 'adm_menu', style: 'primary' }]] };
+    if (editMsgId) return await editMsg(chatId, editMsgId, t, k, TOKEN);
+    return await sendMsg(chatId, t, k, TOKEN);
+  }
 
-          chunks=(archive.zip.*)
-          total=${#chunks[@]}
-          [ $total -eq 0 ] && { chunks=(archive.zip.001); total=1; }
+  const rows = await env.DB.prepare(
+    'SELECT * FROM vip_users ORDER BY subscribed_at DESC LIMIT ? OFFSET ?'
+  ).bind(ADMIN_USERS_PER_PAGE, currentOffset).all();
 
-          curl -s -X POST "${{ secrets.WORKER_URL }}/api/progress" -H "Content-Type: application/json" \
-            -d "{\"user_id\":\"${{ github.event.inputs.user_id }}\",\"stage\":\"upload\",\"percent\":70,\"total_chunks\":$total}" || true
+  let text = `👥 <b>کاربران VIP</b> — صفحه ${currentPage}/${totalPages} (${total} کاربر)\n\n`;
+  const btns = [];
 
-          batch_size=2; start=0; uploaded=0
-          while [ $start -lt $total ]; do
-            end=$((start + batch_size - 1))
-            [ $end -ge $total ] && end=$((total - 1))
-            for i in $(seq $start $end); do git add "${chunks[$i]}" 2>/dev/null || true; done
-            git add README.md
-            git commit -m "Add chunks $((start+1))-$((end+1)) of $total"
-            for attempt in {1..5}; do
-              git push origin "$BRANCH_NAME" && break
-              sleep 10
-            done
-            uploaded=$((end+1))
-            PERCENT=$((70 + uploaded * 28 / total))
-            curl -s -X POST "${{ secrets.WORKER_URL }}/api/progress" -H "Content-Type: application/json" \
-              -d "{\"user_id\":\"${{ github.event.inputs.user_id }}\",\"stage\":\"upload\",\"percent\":$PERCENT,\"uploaded_chunks\":$uploaded}" || true
-            start=$((end + 1)); sleep 2
-          done
-          echo "BRANCH_NAME=$BRANCH_NAME" >> $GITHUB_ENV
-        shell: bash
+  for (const u of (rows.results || [])) {
+    const statusEmoji = u.status === 'active' ? '✅' : u.status === 'grace' ? '⚠️' : '❌';
+    const daysLeft = Math.max(0, Math.ceil((u.expires_at - Date.now()) / 86400000));
+    const name = u.first_name || 'بدون نام';
+    const username = u.username ? `@${u.username}` : '—';
+    text += `${statusEmoji} <b>${name}</b> (${username})\n`;
+    text += `🆔 <code>${u.chat_id}</code> | 📦 ${u.repo_key || '—'} | ⏳ ${daysLeft} روز\n\n`;
+    btns.push([{ text: `⚙️ مدیریت ${name}`, callback_data: `adm_user:${u.chat_id}`, style: 'primary' }]);
+  }
 
-      - name: Notify Worker that job is done
-        if: success()
-        run: |
-          curl -s -X POST "${{ secrets.WORKER_URL }}/api/complete" \
-            -H "Content-Type: application/json" \
-            -d "{\"user_id\":\"${{ github.event.inputs.user_id }}\",\"branch\":\"${{ env.BRANCH_NAME }}\",\"file_size\":${{ env.DOWNLOAD_SIZE }}}"
+  const nav = [];
+  if (currentPage > 1) nav.push({ text: `◀️ قبل`, callback_data: `adm_users:${currentPage - 1}`, style: 'primary' });
+  if (currentPage < totalPages) nav.push({ text: `بعد ▶️`, callback_data: `adm_users:${currentPage + 1}`, style: 'primary' });
+  if (nav.length) btns.push(nav);
+  btns.push([{ text: '🔙 منوی ادمین', callback_data: 'adm_menu', style: 'primary' }]);
 
-      - name: Notify Worker on failure
-        if: failure()
-        run: |
-          curl -s -X POST "${{ secrets.WORKER_URL }}/api/failed" \
-            -H "Content-Type: application/json" \
-            -d "{\"user_id\":\"${{ github.event.inputs.user_id }}\",\"error\":\"Workflow failed\"}"
+  const kb = { inline_keyboard: btns };
+  if (editMsgId) return await editMsg(chatId, editMsgId, text, kb, TOKEN);
+  return await sendMsg(chatId, text, kb, TOKEN);
+}
+
+// نمایش پروفایل کاربر برای ادمین
+async function showAdminUserProfile(env, adminChatId, targetChatId, TOKEN, editMsgId) {
+  const u = await getUser(env, targetChatId);
+  if (!u) {
+    const t = `❌ کاربری با این شناسه یافت نشد.`;
+    const k = { inline_keyboard: [[{ text: '🔙 بازگشت', callback_data: 'adm_users:1', style: 'primary' }]] };
+    if (editMsgId) return await editMsg(adminChatId, editMsgId, t, k, TOKEN);
+    return await sendMsg(adminChatId, t, k, TOKEN);
+  }
+  const statusEmoji = u.status === 'active' ? '✅' : u.status === 'grace' ? '⚠️' : '❌';
+  const daysLeft = Math.max(0, Math.ceil((u.expires_at - Date.now()) / 86400000));
+  const expiresDate = new Date(u.expires_at).toLocaleDateString('fa-IR');
+  const usedBytes = await getUserStorageBytes(env, targetChatId);
+  const fileCount = (await env.DB.prepare('SELECT COUNT(*) AS c FROM vip_files WHERE chat_id = ?').bind(targetChatId).first())?.c || 0;
+
+  const text =
+    `👤 <b>پروفایل کاربر</b>\n\n` +
+    `📛 نام: <b>${u.first_name || '—'}</b>\n` +
+    `👤 یوزرنیم: ${u.username ? `@${u.username}` : '—'}\n` +
+    `🆔 شناسه: <code>${u.chat_id}</code>\n` +
+    `${statusEmoji} وضعیت: <b>${u.status}</b>\n` +
+    `📦 مخزن: <b>${u.repo_key || '—'}</b>\n` +
+    `📅 انقضا: <b>${expiresDate}</b> (${daysLeft} روز)\n` +
+    `💾 فضای مصرفی: <b>${formatBytes(usedBytes)}</b>\n` +
+    `📄 تعداد فایل: <b>${fileCount}</b>`;
+
+  const kb = { inline_keyboard: [
+    [
+      { text: '🗄 تغییر مخزن', callback_data: `adm_chrepo:${targetChatId}`, style: 'primary' },
+      { text: '⏳ تغییر زمان', callback_data: `adm_chtime:${targetChatId}`, style: 'primary' },
+    ],
+    [{ text: '🔄 ریست اطلاعات مخزن', callback_data: `adm_resetrepo:${targetChatId}`, style: 'danger' }],
+    [{ text: '🔙 لیست کاربران', callback_data: 'adm_users:1', style: 'primary' }],
+  ]};
+  if (editMsgId) return await editMsg(adminChatId, editMsgId, text, kb, TOKEN);
+  return await sendMsg(adminChatId, text, kb, TOKEN);
+}
+
+// نمایش مخازن موجود
+async function showAdminRepos(env, chatId, TOKEN, editMsgId) {
+  const repos = await getAllRepos(env);
+  const assigned = await env.DB.prepare(
+    "SELECT repo_key, chat_id, first_name, username FROM vip_users WHERE repo_key IS NOT NULL AND status != 'revoked'"
+  ).all();
+  const assignedMap = {};
+  for (const r of (assigned.results || [])) assignedMap[r.repo_key] = r;
+
+  let text = `🗄 <b>مخازن موجود</b> (${repos.length} عدد)\n\n`;
+  const btns = [];
+
+  if (repos.length === 0) {
+    text += `هیچ مخزنی اضافه نشده.\n`;
+  } else {
+    for (const r of repos) {
+      const user = assignedMap[r.key];
+      const status = user ? `👤 ${user.first_name || user.chat_id}` : `🆓 آزاد`;
+      text += `• <b>${r.key}</b>: <code>${r.owner}/${r.name}</code>\n  🔑 <code>${r.tokenSecret}</code> — ${status}\n\n`;
+      btns.push([{ text: `🗑 حذف ${r.key}`, callback_data: `adm_delrepo:${r.key}`, style: 'danger' }]);
+    }
+  }
+
+  btns.push([{ text: '➕ اضافه کردن مخزن جدید', callback_data: 'adm_addrepo', style: 'success' }]);
+  btns.push([{ text: '🔙 منوی ادمین', callback_data: 'adm_menu', style: 'primary' }]);
+  const kb = { inline_keyboard: btns };
+  if (editMsgId) return await editMsg(chatId, editMsgId, text, kb, TOKEN);
+  return await sendMsg(chatId, text, kb, TOKEN);
+}
+
+// ============================================================
+// دیتابیس
+// ============================================================
+async function initDB(env) {
+  try {
+    // جدول مخازن — owner/name در D1، توکن فقط در Cloudflare Secrets
+    await env.DB.prepare(`CREATE TABLE IF NOT EXISTS repos (
+      repo_key TEXT PRIMARY KEY,
+      owner TEXT NOT NULL,
+      name TEXT NOT NULL,
+      token_secret TEXT NOT NULL,
+      created_at INTEGER
+    )`).run();
+    await env.DB.prepare(`CREATE TABLE IF NOT EXISTS vip_users (
+      chat_id TEXT PRIMARY KEY, repo_key TEXT, repo_key_backup TEXT,
+      subscribed_at INTEGER, expires_at INTEGER, status TEXT DEFAULT 'active',
+      username TEXT, first_name TEXT
+    )`).run();
+    await env.DB.prepare(`CREATE TABLE IF NOT EXISTS vip_files (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id TEXT, branch_name TEXT,
+      file_name TEXT, file_size INTEGER DEFAULT 0, created_at INTEGER,
+      type TEXT DEFAULT 'file', link TEXT, zip_password TEXT, message_id INTEGER
+    )`).run();
+    await env.DB.prepare(`CREATE TABLE IF NOT EXISTS vip_jobs (
+      chat_id TEXT PRIMARY KEY, status TEXT, payload TEXT,
+      message_id INTEGER, branch_name TEXT, updated_at INTEGER
+    )`).run();
+    await env.DB.prepare(`CREATE TABLE IF NOT EXISTS vip_state (
+      chat_id TEXT PRIMARY KEY, state TEXT, updated_at INTEGER
+    )`).run();
+    await env.DB.prepare(`CREATE TABLE IF NOT EXISTS vip_onboard_tokens (
+      token_hash TEXT PRIMARY KEY, used_at INTEGER
+    )`).run();
+    await env.DB.prepare(`CREATE TABLE IF NOT EXISTS bot_settings (
+      key TEXT PRIMARY KEY, value TEXT
+    )`).run();
+    await env.DB.prepare('DELETE FROM vip_onboard_tokens WHERE used_at < ?')
+      .bind(Date.now() - 10 * 60 * 1000).run();
+    // جدول txn_id های مصرف‌شده — ربات سوم اینجا ذخیره می‌کند تا تراکنش تکراری رد کند
+    await env.DB.prepare(`CREATE TABLE IF NOT EXISTS vip_consumed_txn (
+      txn_id TEXT PRIMARY KEY,
+      consumed_at INTEGER NOT NULL
+    )`).run();
+    // پاک‌سازی txn های قدیمی (بیشتر از ۳۰ روز) — نیاز به نگهداری بیشتر نیست
+    await env.DB.prepare('DELETE FROM vip_consumed_txn WHERE consumed_at < ?')
+      .bind(Date.now() - 30 * 24 * 60 * 60 * 1000).run();
+  } catch (e) { console.error('initDB error:', e); }
+}
+
+async function getUser(env, chatId) {
+  return await env.DB.prepare('SELECT * FROM vip_users WHERE chat_id = ?').bind(chatId).first();
+}
+async function setState(env, chatId, state) {
+  await env.DB.prepare('INSERT OR REPLACE INTO vip_state (chat_id, state, updated_at) VALUES (?, ?, ?)')
+    .bind(chatId, JSON.stringify(state), Date.now()).run();
+}
+async function getState(env, chatId) {
+  const row = await env.DB.prepare('SELECT state FROM vip_state WHERE chat_id = ?').bind(chatId).first();
+  return row ? JSON.parse(row.state) : null;
+}
+async function deleteState(env, chatId) {
+  await env.DB.prepare('DELETE FROM vip_state WHERE chat_id = ?').bind(chatId).run();
+}
+async function getJob(env, chatId) {
+  const row = await env.DB.prepare('SELECT * FROM vip_jobs WHERE chat_id = ?').bind(chatId).first();
+  if (!row) return null;
+  return { ...row, payload: row.payload ? JSON.parse(row.payload) : {} };
+}
+async function setJob(env, chatId, status, payload, messageId, branchName) {
+  await env.DB.prepare(
+    'INSERT OR REPLACE INTO vip_jobs (chat_id, status, payload, message_id, branch_name, updated_at) VALUES (?, ?, ?, ?, ?, ?)'
+  ).bind(chatId, status, JSON.stringify(payload), messageId, branchName, Date.now()).run();
+}
+async function deleteJob(env, chatId) {
+  await env.DB.prepare('DELETE FROM vip_jobs WHERE chat_id = ?').bind(chatId).run();
+}
+async function getUserStorageBytes(env, chatId) {
+  const row = await env.DB.prepare(
+    'SELECT COALESCE(SUM(file_size), 0) AS total FROM vip_files WHERE chat_id = ?'
+  ).bind(chatId).first();
+  return row ? Number(row.total) : 0;
+}
+
+// ============================================================
+// توابع کمکی
+// ============================================================
+function formatBytes(bytes) {
+  if (!bytes) return '0 B';
+  if (bytes < 1024) return bytes + ' B';
+  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+  if (bytes < 1024 * 1024 * 1024) return (bytes / 1024 / 1024).toFixed(1) + ' MB';
+  return (bytes / 1024 / 1024 / 1024).toFixed(2) + ' GB';
+}
+function buildBar(percent) {
+  const f = Math.round(percent / 10);
+  return '█'.repeat(f) + '░'.repeat(10 - f);
+}
+function generatePassword() {
+  const c = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789';
+  return Array.from({length: 8}, () => c[Math.floor(Math.random() * c.length)]).join('');
+}
+
+// ============================================================
+// تلگرام
+// ============================================================
+async function tgCall(TOKEN, method, body) {
+  const res = await fetch(`https://api.telegram.org/bot${TOKEN}/${method}`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body)
+  });
+  return await res.json();
+}
+async function sendMsg(chatId, text, keyboard, TOKEN) {
+  const body = { chat_id: chatId, text, parse_mode: 'HTML' };
+  if (keyboard) body.reply_markup = JSON.stringify(keyboard);
+  return await tgCall(TOKEN, 'sendMessage', body);
+}
+async function editMsg(chatId, msgId, text, keyboard, TOKEN) {
+  if (!msgId) return await sendMsg(chatId, text, keyboard, TOKEN);
+  const body = { chat_id: chatId, message_id: msgId, text, parse_mode: 'HTML' };
+  if (keyboard) body.reply_markup = JSON.stringify(keyboard);
+  const result = await tgCall(TOKEN, 'editMessageText', body);
+  if (!result.ok && result.error_code !== 400) {
+    return await sendMsg(chatId, text, keyboard, TOKEN);
+  }
+  return result;
+}
+async function delMsg(chatId, msgId, TOKEN) {
+  if (!msgId) return;
+  await tgCall(TOKEN, 'deleteMessage', { chat_id: chatId, message_id: msgId });
+}
+
+// ============================================================
+// منوی اصلی
+// ============================================================
+function mainKeyboard() {
+  return { inline_keyboard: [
+    [
+      { text: '📥 لینک مستقیم',   callback_data: 'dl_link',   style: 'primary' },
+      { text: '📤 آپلود فایل',    callback_data: 'dl_upload', style: 'primary' },
+    ],
+    [
+      { text: '🎬 یوتوپیا (یوتیوب)', callback_data: 'dl_yt', style: 'primary' },
+    ],
+    [
+      { text: '📂 فایل‌های من',      callback_data: 'files:1', style: 'primary' },
+      { text: '💾 فضای ذخیره‌سازی', callback_data: 'storage',  style: 'primary' },
+    ],
+  ]};
+}
+
+function cancelKeyboard() {
+  return { inline_keyboard: [
+    [{ text: '❌ انصراف', callback_data: 'cancel', style: 'danger' }]
+  ]};
+}
+
+function backKeyboard() {
+  return { inline_keyboard: [
+    [{ text: '🏠 منوی اصلی', callback_data: 'main', style: 'primary' }]
+  ]};
+}
+
+function passKeyboard(passBtn) {
+  return { inline_keyboard: [
+    [{ text: `🎲 رمز تصادفی: ${passBtn}`, callback_data: `use_pass:${passBtn}`, style: 'success' }],
+    [{ text: '❌ انصراف', callback_data: 'cancel', style: 'danger' }]
+  ]};
+}
+
+async function showMain(chatId, user, TOKEN, env, editMsgId) {
+  const usedBytes = await getUserStorageBytes(env, chatId);
+  const pct = Math.min(100, Math.round(usedBytes / MAX_STORAGE_BYTES * 100));
+  const expiresDate = new Date(user.expires_at).toLocaleDateString('fa-IR');
+  const daysLeft = Math.max(0, Math.ceil((user.expires_at - Date.now()) / 86400000));
+  const text =
+    `👑 <b>پنل اختصاصی VIP</b>\n\n` +
+    `👤 ${user.first_name || 'کاربر'}\n` +
+    `📅 اشتراک تا: <b>${expiresDate}</b> (${daysLeft} روز)\n\n` +
+    `💾 ${buildBar(pct)} ${pct}%\n` +
+    `   ${formatBytes(usedBytes)} از ${formatBytes(MAX_STORAGE_BYTES)}\n\n` +
+    `یکی از گزینه‌های زیر را انتخاب کنید:`;
+  if (editMsgId) return await editMsg(chatId, editMsgId, text, mainKeyboard(), TOKEN);
+  return await sendMsg(chatId, text, mainKeyboard(), TOKEN);
+}
+
+// ============================================================
+// نمایش فایل‌ها — با شماره ردیف و صفحه‌بندی ۵ فایل در هر صفحه
+// ============================================================
+const FILES_PER_PAGE = 5;
+
+async function showFiles(env, chatId, page, TOKEN, editMsgId) {
+  // page: شماره صفحه از ۱ به بعد
+  const pageNum = Math.max(1, page || 1);
+  const offset = (pageNum - 1) * FILES_PER_PAGE;
+
+  const totalRow = await env.DB.prepare('SELECT COUNT(*) AS c FROM vip_files WHERE chat_id = ?').bind(chatId).first();
+  const total = totalRow?.c || 0;
+  const totalPages = Math.max(1, Math.ceil(total / FILES_PER_PAGE));
+  const currentPage = Math.min(pageNum, totalPages);
+  const currentOffset = (currentPage - 1) * FILES_PER_PAGE;
+
+  if (total === 0) {
+    const emptyText = `📂 <b>فایل‌های من</b>\n\nهیچ فایلی ذخیره نشده.`;
+    const emptyKb = { inline_keyboard: [[{ text: '🏠 منوی اصلی', callback_data: 'main', style: 'primary' }]] };
+    if (editMsgId) return await editMsg(chatId, editMsgId, emptyText, emptyKb, TOKEN);
+    return await sendMsg(chatId, emptyText, emptyKb, TOKEN);
+  }
+
+  const rows = await env.DB.prepare(
+    'SELECT * FROM vip_files WHERE chat_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?'
+  ).bind(chatId, FILES_PER_PAGE, currentOffset).all();
+
+  // شماره ردیف جهانی: ردیف ۱ = جدیدترین فایل در کل
+  let text = `📂 <b>فایل‌های من</b>
+`;
+  text += `📄 صفحه <b>${currentPage}</b> از <b>${totalPages}</b> — ${total} فایل
+`;
+
+  const btns = [];
+  let rowNum = currentOffset + 1; // شماره ردیف جهانی
+
+  for (const f of (rows.results || [])) {
+    const icon = f.type === 'youtube' ? '🎬' : '📄';
+    const date = new Date(f.created_at).toLocaleDateString('fa-IR');
+    const sizeStr = formatBytes(f.file_size);
+    const passStr = f.zip_password || '—';
+
+    text += `
+┌ <b>#${rowNum}</b> ${icon} <b>${f.file_name || 'فایل'}</b>
+`;
+    text += `├ 📦 ${sizeStr}  |  📅 ${date}
+`;
+    text += `└ 🔑 <code>${passStr}</code>
+`;
+
+    // دکمه دانلود با شماره ردیف
+    btns.push([
+      { text: `⬇️ #${rowNum} دانلود`, url: f.link || '#', style: 'primary' },
+    ]);
+    // دکمه حذف با شماره ردیف
+    btns.push([
+      { text: `🗑 #${rowNum} حذف`, callback_data: `del_file:${f.id}`, style: 'danger' },
+    ]);
+
+    rowNum++;
+  }
+
+  // دکمه‌های ناوبری صفحات
+  const nav = [];
+  if (currentPage > 1) nav.push({ text: `◀️ صفحه ${currentPage - 1}`, callback_data: `files:${currentPage - 1}`, style: 'primary' });
+  if (currentPage < totalPages) nav.push({ text: `صفحه ${currentPage + 1} ▶️`, callback_data: `files:${currentPage + 1}`, style: 'primary' });
+  if (nav.length) btns.push(nav);
+
+  btns.push([{ text: '🔙 منوی اصلی', callback_data: 'main', style: 'primary' }]);
+  const kb = { inline_keyboard: btns };
+  if (editMsgId) return await editMsg(chatId, editMsgId, text, kb, TOKEN);
+  return await sendMsg(chatId, text, kb, TOKEN);
+}
+
+// ============================================================
+// GitHub
+// ============================================================
+async function triggerWorkflow(env, repo, chatId, inputs) {
+  const body = {
+    ref: 'main',
+    inputs: { ...inputs, user_id: chatId.toString() }
+  };
+  const res = await fetch(
+  `https://api.github.com/repos/${repo.owner}/${repo.name}/actions/workflows/download_vip.yml/dispatches`,
+  {
+    method: 'POST',
+    headers: {
+      Authorization: `token ${repo.token}`,
+      Accept: 'application/vnd.github.v3+json',
+      'Content-Type': 'application/json',
+      'User-Agent': 'CloudflareWorker-VIPBot/1.0'   // ← خط اضافه شده
+    },
+    body: JSON.stringify(body)
+  }
+);
+  if (res.status !== 204) {
+    console.error(`GitHub dispatch error: ${res.status} ${await res.text()}`);
+    return false;
+  }
+  return true;
+}
+
+async function deleteBranch(repo, branch) {
+  try {
+    await fetch(`https://api.github.com/repos/${repo.owner}/${repo.name}/git/refs/heads/${branch}`, {
+  method: 'DELETE',
+  headers: { 
+    Authorization: `token ${repo.token}`, 
+    Accept: 'application/vnd.github.v3+json',
+    'User-Agent': 'CloudflareWorker-VIPBot/1.0'   // ← خط اضافه شده
+  }
+});
+  } catch {}
+}
+
+
+
+async function verifyRenewalToken(env, token) {
+  try {
+    const secret = env.VIP_BOT_SECRET || 'default_secret_change_me_32chars!';
+    if (!token.startsWith('VR')) return null;
+    const parts = token.substring(2).split('_');
+    // ساختار جدید: VR{slot}_{chatB36}_{txnB36}_{hmac}  (4 قسمت)
+    // ساختار قدیم: VR{slot}_{chatB36}_{hmac}            (3 قسمت — backward compat)
+    if (parts.length < 3 || parts.length > 4) return null;
+    const slotS = parts[0];
+    if (slotS.length !== 3) return null;
+    const tokenSlot = parseInt(slotS, 10);
+    const now = currentSlot();
+    const diff = (now - tokenSlot + 1000) % 1000;
+    if (diff > 4) return null;
+
+    if (parts.length === 4) {
+      // ساختار جدید با txn_id
+      const [, chatB36, txnB36, hmacR] = parts;
+      const expectedHmac = await shortHmac(secret, `renew:${tokenSlot}:${chatB36}:${txnB36}`);
+      if (hmacR !== expectedHmac) return null;
+      // txnId را از base36 به hex برمی‌گردانیم
+      const txnHex = BigInt(parseInt(txnB36, 36)).toString(16);
+      return { chatId: fromBase36(chatB36), txnId: txnHex };
+    } else {
+      // ساختار قدیم (backward compat)
+      const [, chatB36, hmacR] = parts;
+      const expectedHmac = await shortHmac(secret, `renew:${tokenSlot}:${chatB36}`);
+      if (hmacR !== expectedHmac) return null;
+      return { chatId: fromBase36(chatB36), txnId: null };
+    }
+  } catch { return null; }
+}
+
+// جدول vip_consumed_txn در دیتابیس ربات سوم — برای جلوگیری از مصرف مجدد
+// کاملاً مستقل از ربات اول — هیچ ارتباطی بین دو ربات نیست
+async function isTxnConsumed(env, txnId) {
+  if (!txnId) return false;
+  try {
+    const row = await env.DB.prepare('SELECT txn_id FROM vip_consumed_txn WHERE txn_id = ?').bind(txnId).first();
+    return !!row;
+  } catch { return false; }
+}
+
+async function markTxnConsumed(env, txnId) {
+  if (!txnId) return;
+  try {
+    await env.DB.prepare('INSERT OR IGNORE INTO vip_consumed_txn (txn_id, consumed_at) VALUES (?, ?)').bind(txnId, Date.now()).run();
+  } catch {}
+}
+
+
+// ============================================================
+// پردازش دانلود
+// ============================================================
+async function startDownload(env, chatId, state, password, user, TOKEN) {
+  const repo = await getRepoByKey(env, user.repo_key);
+  if (!repo) {
+    await sendMsg(chatId, `❌ ریپوی اختصاصی شما یافت نشد. با پشتیبانی تماس بگیرید.`, backKeyboard(), TOKEN);
+    return;
+  }
+  const existingJob = await getJob(env, chatId);
+  if (existingJob?.status === 'processing') {
+    await sendMsg(chatId, `⚠️ یک عملیات در حال اجرا دارید. صبر کنید.`, backKeyboard(), TOKEN);
+    return;
+  }
+  const waitRes = await sendMsg(chatId, `⏳ <b>در حال پردازش...</b>\n\nدرخواست در صف قرار گرفت.`, null, TOKEN);
+  const waitMsgId = waitRes?.result?.message_id;
+  let triggered = false;
+  let jobPayload = { zip_password: password };
+
+  if (state.type === 'link') {
+    jobPayload = { ...jobPayload, type: 'file', file_name: state.fileName || 'file' };
+    await setJob(env, chatId, 'processing', jobPayload, waitMsgId, null);
+    triggered = await triggerWorkflow(env, repo, chatId, {
+      file_url: state.fileUrl, file_id: '', zip_password: password, media_url: ''
+    });
+  } else if (state.type === 'upload') {
+    jobPayload = { ...jobPayload, type: 'file', file_name: state.fileName || 'file', file_size: state.fileSize || 0 };
+    await setJob(env, chatId, 'processing', jobPayload, waitMsgId, null);
+    triggered = await triggerWorkflow(env, repo, chatId, {
+      file_url: '', file_id: state.fileId,
+      chat_id: chatId.toString(), message_id: (state.msgId || '').toString(),
+      zip_password: password, media_url: ''
+    });
+  } else if (state.type === 'youtube') {
+    jobPayload = { ...jobPayload, type: 'youtube', file_name: 'YouTube_video.mp4' };
+    await setJob(env, chatId, 'processing', jobPayload, waitMsgId, null);
+    triggered = await triggerWorkflow(env, repo, chatId, {
+      file_url: '', file_id: '', zip_password: password,
+      media_url: state.youtubeUrl,
+      desired_quality: state.quality || '720',
+      min_quality: '360',
+      max_size_mb: '4096'
+    });
+  }
+
+  if (!triggered) {
+    if (waitMsgId) await delMsg(chatId, waitMsgId, TOKEN);
+    await deleteJob(env, chatId);
+    await sendMsg(chatId, `❌ خطا در شروع عملیات. دوباره تلاش کنید.`, backKeyboard(), TOKEN);
+  }
+}
+
+// ============================================================
+// Cron: چک منقضی‌شده‌ها
+// ============================================================
+async function checkExpired(env, TOKEN) {
+  if (!env.DB) {
+    console.error('❌ D1 database binding (env.DB) is missing!');
+    return;
+  }
+  const now = Date.now();
+  const bot1 = env.BOT1_USERNAME || 'filesmanagement_bot';
+
+  // active → grace
+  const expired = await env.DB.prepare(
+    "SELECT * FROM vip_users WHERE status = 'active' AND expires_at < ?"
+  ).bind(now).all();
+
+  for (const user of (expired.results || [])) {
+    const graceEnd = user.expires_at + GRACE_DAYS * 86400000;
+    if (now < graceEnd) {
+      await env.DB.prepare("UPDATE vip_users SET status = 'grace' WHERE chat_id = ?").bind(user.chat_id).run();
+      const dLeft = Math.ceil((graceEnd - now) / 86400000);
+      await sendMsg(user.chat_id,
+        `⚠️ <b>اشتراک VIP شما منقضی شد</b>\n\nمهلت تمدید: <b>${dLeft} روز</b>\n\nدر صورت عدم تمدید، تمام فایل‌های شما حذف می‌شوند.`,
+        { inline_keyboard: [[{ text: '🔄 تمدید اشتراک', url: `https://t.me/${bot1}`, style: 'success' }]] }, TOKEN);
+    } else {
+      await revokeUser(env, user, TOKEN);
+    }
+  }
+
+  // grace → revoke
+  const graceExpired = await env.DB.prepare(
+    "SELECT * FROM vip_users WHERE status = 'grace' AND expires_at + ? < ?"
+  ).bind(GRACE_DAYS * 86400000, now).all();
+  for (const user of (graceExpired.results || [])) {
+    await revokeUser(env, user, TOKEN);
+  }
+}
+
+async function revokeUser(env, user, TOKEN) {
+  const bot1 = env.BOT1_USERNAME || 'filesmanagement_bot';
+  try {
+    if (user.repo_key) {
+      const repo = await getRepoByKey(env, user.repo_key);
+      if (repo) {
+        const files = await env.DB.prepare('SELECT branch_name FROM vip_files WHERE chat_id = ?').bind(user.chat_id).all();
+        for (const f of (files.results || [])) if (f.branch_name) await deleteBranch(repo, f.branch_name);
+      }
+    }
+    await env.DB.prepare('DELETE FROM vip_files WHERE chat_id = ?').bind(user.chat_id).run();
+    await env.DB.prepare('DELETE FROM vip_jobs WHERE chat_id = ?').bind(user.chat_id).run();
+    await env.DB.prepare('DELETE FROM vip_state WHERE chat_id = ?').bind(user.chat_id).run();
+    // ریپو رو آزاد کن ولی backup بگیر برای تمدید
+    await env.DB.prepare("UPDATE vip_users SET status = 'revoked', repo_key_backup = repo_key, repo_key = NULL WHERE chat_id = ?")
+      .bind(user.chat_id).run();
+    await sendMsg(user.chat_id,
+      `❌ <b>اشتراک VIP شما به پایان رسید</b>\n\nتمام فایل‌های شما حذف شدند.\nبرای خرید مجدد اشتراک:`,
+      { inline_keyboard: [[{ text: '🛒 خرید اشتراک', url: `https://t.me/${bot1}`, style: 'success' }]] }, TOKEN);
+  } catch (e) { console.error('revokeUser error:', e); }
+}
+
+// ============================================================
+// Worker Main
+// ============================================================
+export default {
+  async fetch(request, env, ctx) {
+    const TOKEN = env.TELEGRAM_TOKEN;
+    if (!TOKEN) return new Response('No token', { status: 500 });
+
+    ctx.waitUntil(initDB(env));
+
+    const url = new URL(request.url);
+    const path = url.pathname;
+
+    // ============================================================
+    // API از GitHub Actions
+    // ============================================================
+    if (path === '/api/started' && request.method === 'POST') {
+      const data = await request.json().catch(() => ({}));
+      const chatId = data.user_id?.toString();
+      if (chatId) {
+        const job = await getJob(env, chatId);
+        if (job?.message_id) await editMsg(chatId, job.message_id, `⏳ <b>شروع شد...</b>\n\nعملیات آغاز شد.`, null, TOKEN);
+      }
+      return new Response('OK');
+    }
+
+    if (path === '/api/progress' && request.method === 'POST') {
+      const data = await request.json().catch(() => ({}));
+      const chatId = data.user_id?.toString();
+      if (!chatId) return new Response('OK');
+      const job = await getJob(env, chatId);
+      if (!job?.message_id) return new Response('OK');
+      const { stage, percent, total_chunks, uploaded_chunks } = data;
+      let stageText = stage === 'download' ? '⬇️ دانلود...' : stage === 'compress' ? '🗜 فشرده‌سازی...' : '⬆️ آپلود...';
+      let txt = stageText;
+      if (percent > 0) txt += `\n${buildBar(percent)} ${percent}%`;
+      if (total_chunks !== undefined) txt += `\n📦 مجموع: ${total_chunks} بخش`;
+      if (uploaded_chunks !== undefined) txt += `\n✅ آپلود: ${uploaded_chunks}`;
+      await editMsg(chatId, job.message_id, `⏳ <b>در حال پردازش...</b>\n\n${txt}`, null, TOKEN);
+      return new Response('OK');
+    }
+
+    if (path === '/api/complete' && request.method === 'POST') {
+      const data = await request.json().catch(() => ({}));
+      const chatId = data.user_id?.toString();
+      const branch = data.branch || data.branch_name;
+      if (!chatId || !branch) return new Response('OK');
+
+      const job = await getJob(env, chatId);
+      if (!job) return new Response('OK');
+      const user = await getUser(env, chatId);
+      if (!user?.repo_key) return new Response('OK');
+      const repo = await getRepoByKey(env, user.repo_key);
+      if (!repo) return new Response('OK');
+
+      const link = `https://codeload.github.com/${repo.owner}/${repo.name}/zip/refs/heads/${branch}`;
+      const payload = job.payload || {};
+      const password = payload.zip_password || '';
+      const fileName = payload.file_name || 'فایل';
+      const fileSize = Number(data.file_size) || payload.file_size || 0;
+
+      // بررسی سقف فضا
+      const usedBytes = await getUserStorageBytes(env, chatId);
+      if (usedBytes + fileSize > MAX_STORAGE_BYTES) {
+        if (job.message_id) await delMsg(chatId, job.message_id, TOKEN);
+        await deleteBranch(repo, branch);
+        await deleteJob(env, chatId);
+        await sendMsg(chatId,
+          `❌ <b>فضای کافی ندارید</b>\n\nفایل پردازش شد اما ${formatBytes(usedBytes)} از ${formatBytes(MAX_STORAGE_BYTES)} مصرف شده.\n\nبرخی فایل‌های قدیمی را حذف کنید.`,
+          { inline_keyboard: [[{ text: '📂 مدیریت فایل‌ها', callback_data: 'files:0', style: 'primary' }]] }, TOKEN);
+        return new Response('OK');
+      }
+
+      await env.DB.prepare(
+        'INSERT INTO vip_files (chat_id, branch_name, file_name, file_size, created_at, type, link, zip_password) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
+      ).bind(chatId, branch, fileName, fileSize, Date.now(), payload.type || 'file', link, password).run();
+
+      if (job.message_id) await delMsg(chatId, job.message_id, TOKEN);
+      await deleteJob(env, chatId);
+
+      const icon = payload.type === 'youtube' ? '🎬' : '📄';
+      await sendMsg(chatId,
+        `✅ <b>${icon} آماده دانلود!</b>\n\n` +
+        `📄 <b>نام:</b> ${fileName}\n` +
+        `📦 <b>حجم:</b> ${formatBytes(fileSize)}\n\n` +
+        `🔗 <b>لینک دانلود:</b>\n${link}\n\n` +
+        `🔑 <b>رمز فایل:</b> <code>${password}</code>\n\n` +
+        `📌 برای استخراج: فایل zip دانلودی را باز کنید و رمز بالا را وارد کنید (7-Zip یا WinRAR).`,
+        { inline_keyboard: [
+          [{ text: '📂 فایل‌های من', callback_data: 'files:0', style: 'primary' }],
+          [{ text: '🏠 منوی اصلی', callback_data: 'main', style: 'primary' }]
+        ] }, TOKEN);
+      return new Response('OK');
+    }
+
+    if (path === '/api/failed' && request.method === 'POST') {
+      const data = await request.json().catch(() => ({}));
+      const chatId = data.user_id?.toString();
+      if (chatId) {
+        const job = await getJob(env, chatId);
+        if (job?.message_id) await delMsg(chatId, job.message_id, TOKEN);
+        await deleteJob(env, chatId);
+        await sendMsg(chatId, `❌ <b>خطا در پردازش</b>\n\nدوباره تلاش کنید.`, backKeyboard(), TOKEN);
+      }
+      return new Response('OK');
+    }
+
+    if (request.method !== 'POST') return new Response('VIP Bot Active ✅');
+
+    let update;
+    try { update = await request.json(); } catch { return new Response('Bad Request', { status: 400 }); }
+
+    // ============================================================
+    // Callback Query
+    // ============================================================
+    if (update.callback_query) {
+      const cb = update.callback_query;
+      const cbChatId = cb.message?.chat?.id?.toString();
+      const cbData = cb.data || '';
+      const cbMsgId = cb.message?.message_id;
+
+      await tgCall(TOKEN, 'answerCallbackQuery', { callback_query_id: cb.id });
+
+      const cbUser = await getUser(env, cbChatId);
+      // ادمین از بررسی VIP معاف است
+      if (!isAdmin(env, cbChatId)) {
+        if (!cbUser || cbUser.status === 'revoked') {
+          await editMsg(cbChatId, cbMsgId, `🔒 دسترسی VIP ندارید.`,
+            { inline_keyboard: [[{ text: '🛒 خرید اشتراک', url: `https://t.me/${env.BOT1_USERNAME || 'filesmanagement_bot'}`, style: 'success' }]] }, TOKEN);
+          return new Response('OK');
+        }
+        if (cbUser.status === 'grace') {
+          await editMsg(cbChatId, cbMsgId, `⚠️ اشتراک منقضی شده. برای ادامه تمدید کنید.`,
+            { inline_keyboard: [[{ text: '🔄 تمدید', url: `https://t.me/${env.BOT1_USERNAME || 'filesmanagement_bot'}`, style: 'success' }]] }, TOKEN);
+          return new Response('OK');
+        }
+      }
+
+      if (cbData === 'main') {
+        await deleteState(env, cbChatId);
+        await showMain(cbChatId, cbUser, TOKEN, env, cbMsgId);
+        return new Response('OK');
+      }
+
+      if (cbData === 'dl_link') {
+        await setState(env, cbChatId, { step: 'awaiting_url' });
+        await editMsg(cbChatId, cbMsgId, `📥 <b>دانلود از لینک</b>\n\nلینک مستقیم فایل را ارسال کنید:`,
+          cancelKeyboard(), TOKEN);
+        return new Response('OK');
+      }
+
+      if (cbData === 'dl_upload') {
+        await setState(env, cbChatId, { step: 'awaiting_file' });
+        await editMsg(cbChatId, cbMsgId, `📤 <b>آپلود فایل</b>\n\nفایل خود را برای من ارسال کنید:`,
+          cancelKeyboard(), TOKEN);
+        return new Response('OK');
+      }
+
+      if (cbData === 'dl_yt') {
+        await setState(env, cbChatId, { step: 'awaiting_yt_url' });
+        await editMsg(cbChatId, cbMsgId, `🎬 <b>یوتوپیا</b>\n\nلینک ویدیوی یوتیوب را ارسال کنید:`,
+          cancelKeyboard(), TOKEN);
+        return new Response('OK');
+      }
+
+      if (cbData === 'cancel') {
+        await deleteState(env, cbChatId);
+        await showMain(cbChatId, cbUser, TOKEN, env, cbMsgId);
+        return new Response('OK');
+      }
+
+      if (cbData.startsWith('files:')) {
+        // عدد بعد از : شماره صفحه است (از ۱ به بعد)
+        const page = parseInt(cbData.split(':')[1]) || 1;
+        await showFiles(env, cbChatId, page, TOKEN, cbMsgId);
+        return new Response('OK');
+      }
+
+      if (cbData === 'storage') {
+        const usedBytes = await getUserStorageBytes(env, cbChatId);
+        const pct = Math.min(100, Math.round(usedBytes / MAX_STORAGE_BYTES * 100));
+        await editMsg(cbChatId, cbMsgId,
+          `💾 <b>فضای ذخیره‌سازی</b>\n\n${buildBar(pct)} ${pct}%\n\n` +
+          `✅ استفاده: <b>${formatBytes(usedBytes)}</b>\n` +
+          `📦 کل: <b>${formatBytes(MAX_STORAGE_BYTES)}</b>\n` +
+          `🆓 آزاد: <b>${formatBytes(MAX_STORAGE_BYTES - usedBytes)}</b>`,
+          { inline_keyboard: [
+            [{ text: '🗑 مدیریت فایل‌ها', callback_data: 'files:0', style: 'primary' }],
+            [{ text: '🔙 منوی اصلی', callback_data: 'main', style: 'primary' }]
+          ] }, TOKEN);
+        return new Response('OK');
+      }
+
+      if (cbData.startsWith('del_file:')) {
+        const fileId = parseInt(cbData.split(':')[1]);
+        const f = await env.DB.prepare('SELECT * FROM vip_files WHERE id = ? AND chat_id = ?').bind(fileId, cbChatId).first();
+        if (f) {
+          if (cbUser.repo_key && f.branch_name) {
+            const repo = await getRepoByKey(env, cbUser.repo_key);
+            if (repo) await deleteBranch(repo, f.branch_name);
+          }
+          await env.DB.prepare('DELETE FROM vip_files WHERE id = ?').bind(fileId).run();
+        }
+        await showFiles(env, cbChatId, 1, TOKEN, cbMsgId);
+        return new Response('OK');
+      }
+
+      // انتخاب کیفیت یوتیوب
+      if (cbData.startsWith('yt_q:')) {
+        const quality = cbData.split(':')[1];
+        const state = await getState(env, cbChatId);
+        if (!state || state.step !== 'awaiting_yt_quality') return new Response('OK');
+        await setState(env, cbChatId, { ...state, step: 'awaiting_pass', quality });
+        const passBtn = generatePassword();
+        await editMsg(cbChatId, cbMsgId,
+          `🎬 کیفیت: <b>${quality}p</b>\n\n🔑 رمز فایل را تایپ کنید یا رمز تصادفی بزنید:`,
+          passKeyboard(passBtn), TOKEN);
+        return new Response('OK');
+      }
+
+      // استفاده از رمز پیشنهادی
+      if (cbData.startsWith('use_pass:')) {
+        const password = cbData.split(':').slice(1).join(':');
+        const state = await getState(env, cbChatId);
+        if (!state || state.step !== 'awaiting_pass') return new Response('OK');
+        await editMsg(cbChatId, cbMsgId, `⏳ <b>در حال شروع...</b>\n\nدرخواست ارسال شد.`, null, TOKEN);
+        await deleteState(env, cbChatId);
+        await startDownload(env, cbChatId, state, password, cbUser, TOKEN);
+        return new Response('OK');
+      }
+
+      // ============================================================
+      // Callback های ادمین
+      // ============================================================
+      if (isAdmin(env, cbChatId)) {
+        if (cbData === 'adm_menu') {
+          await showAdminMenu(cbChatId, TOKEN, cbMsgId);
+          return new Response('OK');
+        }
+
+        if (cbData === 'adm_repos') {
+          await showAdminRepos(env, cbChatId, TOKEN, cbMsgId);
+          return new Response('OK');
+        }
+
+        if (cbData === 'adm_addrepo') {
+          await setState(env, cbChatId, { step: 'adm_addrepo_input' });
+          await editMsg(cbChatId, cbMsgId,
+            `➕ <b>اضافه کردن مخزن جدید</b>\n\n` +
+            `اطلاعات مخزن را در این فرمت ارسال کنید:\n\n` +
+            `<code>owner/repo-name/GH_TOKEN_1</code>\n\n` +
+            `• <b>owner</b>: نام کاربری GitHub\n` +
+            `• <b>repo-name</b>: نام مخزن\n` +
+            `• <b>GH_TOKEN_1</b>: نام Secret که توکن را در آن ذخیره کردید\n\n` +
+            `⚠️ قبل از اضافه کردن، مطمئن شوید Secret را در Cloudflare تنظیم کرده‌اید.`,
+            { inline_keyboard: [[{ text: '❌ انصراف', callback_data: 'adm_repos', style: 'danger' }]] }, TOKEN);
+          return new Response('OK');
+        }
+
+        if (cbData.startsWith('adm_delrepo:')) {
+          const repoKey = cbData.split(':')[1];
+          // بررسی آیا مخزن به کاربری تخصیص دارد
+          const inUse = await env.DB.prepare(
+            "SELECT chat_id FROM vip_users WHERE repo_key = ? AND status != 'revoked'"
+          ).bind(repoKey).first();
+          if (inUse) {
+            await editMsg(cbChatId, cbMsgId,
+              `❌ مخزن <b>${repoKey}</b> در حال حاضر به کاربر <code>${inUse.chat_id}</code> تخصیص دارد و قابل حذف نیست.\n\nابتدا مخزن کاربر را تغییر دهید.`,
+              { inline_keyboard: [[{ text: '🔙 بازگشت', callback_data: 'adm_repos', style: 'primary' }]] }, TOKEN);
+            return new Response('OK');
+          }
+          await env.DB.prepare('DELETE FROM repos WHERE repo_key = ?').bind(repoKey).run();
+          await showAdminRepos(env, cbChatId, TOKEN, cbMsgId);
+          return new Response('OK');
+        }
+
+        if (cbData === 'adm_search') {
+          await setState(env, cbChatId, { step: 'adm_search' });
+          await editMsg(cbChatId, cbMsgId,
+            `🔍 <b>جستجوی کاربر</b>\n\nشناسه تلگرام یا یوزرنیم کاربر را وارد کنید:`,
+            { inline_keyboard: [[{ text: '❌ انصراف', callback_data: 'adm_menu', style: 'danger' }]] }, TOKEN);
+          return new Response('OK');
+        }
+
+        if (cbData.startsWith('adm_users:')) {
+          const page = parseInt(cbData.split(':')[1]) || 1;
+          await showAdminUsers(env, cbChatId, page, TOKEN, cbMsgId);
+          return new Response('OK');
+        }
+
+        if (cbData.startsWith('adm_user:')) {
+          const targetChatId = cbData.split(':')[1];
+          await showAdminUserProfile(env, cbChatId, targetChatId, TOKEN, cbMsgId);
+          return new Response('OK');
+        }
+
+        if (cbData.startsWith('adm_chrepo:')) {
+          const targetChatId = cbData.split(':')[1];
+          const repos = await getAllRepos(env);
+          if (repos.length === 0) {
+            await editMsg(cbChatId, cbMsgId, `❌ هیچ مخزنی تنظیم نشده.`,
+              { inline_keyboard: [[{ text: '🔙 بازگشت', callback_data: `adm_user:${targetChatId}`, style: 'primary' }]] }, TOKEN);
+            return new Response('OK');
+          }
+          const repoButtons = repos.map(r => [{ text: `${r.key}: ${r.owner}/${r.name}`, callback_data: `adm_setrepo:${targetChatId}:${r.key}`, style: 'primary' }]);
+          repoButtons.push([{ text: '❌ انصراف', callback_data: `adm_user:${targetChatId}`, style: 'danger' }]);
+          await editMsg(cbChatId, cbMsgId,
+            `🗄 <b>انتخاب مخزن جدید</b>\n\nمخزن مورد نظر را انتخاب کنید:`,
+            { inline_keyboard: repoButtons }, TOKEN);
+          return new Response('OK');
+        }
+
+        if (cbData.startsWith('adm_setrepo:')) {
+          const parts = cbData.split(':');
+          const targetChatId = parts[1];
+          const repoKey = parts[2];
+          const repo = await getRepoByKey(env, repoKey);
+          if (!repo) {
+            await editMsg(cbChatId, cbMsgId, `❌ مخزن یافت نشد.`,
+              { inline_keyboard: [[{ text: '🔙 بازگشت', callback_data: `adm_user:${targetChatId}`, style: 'primary' }]] }, TOKEN);
+            return new Response('OK');
+          }
+          await env.DB.prepare('UPDATE vip_users SET repo_key = ? WHERE chat_id = ?')
+            .bind(repoKey, targetChatId).run();
+          await sendMsg(targetChatId,
+            `🔄 <b>مخزن اختصاصی شما تغییر کرد.</b>\n\n📦 مخزن جدید: <b>${repo.owner}/${repo.name}</b>`, null, TOKEN);
+          await editMsg(cbChatId, cbMsgId,
+            `✅ مخزن کاربر <code>${targetChatId}</code> به <b>${repoKey}</b> تغییر یافت.`,
+            { inline_keyboard: [[{ text: '🔙 پروفایل کاربر', callback_data: `adm_user:${targetChatId}`, style: 'primary' }]] }, TOKEN);
+          return new Response('OK');
+        }
+
+        if (cbData.startsWith('adm_chtime:')) {
+          const targetChatId = cbData.split(':')[1];
+          await setState(env, cbChatId, { step: 'adm_chtime', targetChatId });
+          await editMsg(cbChatId, cbMsgId,
+            `⏳ <b>تغییر زمان اشتراک</b>\n\nتعداد روز را وارد کنید:\n• عدد مثبت: افزایش\n• عدد منفی: کاهش\n\nمثال: <code>30</code> یا <code>-7</code>`,
+            { inline_keyboard: [[{ text: '❌ انصراف', callback_data: `adm_user:${targetChatId}`, style: 'danger' }]] }, TOKEN);
+          return new Response('OK');
+        }
+
+        if (cbData.startsWith('adm_resetrepo:')) {
+          const targetChatId = cbData.split(':')[1];
+          const targetUser = await getUser(env, targetChatId);
+          if (!targetUser?.repo_key) {
+            await editMsg(cbChatId, cbMsgId, `❌ کاربر مخزن فعالی ندارد.`,
+              { inline_keyboard: [[{ text: '🔙 بازگشت', callback_data: `adm_user:${targetChatId}`, style: 'primary' }]] }, TOKEN);
+            return new Response('OK');
+          }
+          const repo = await getRepoByKey(env, targetUser.repo_key);
+          if (repo) {
+            const files = await env.DB.prepare('SELECT branch_name FROM vip_files WHERE chat_id = ?').bind(targetChatId).all();
+            for (const f of (files.results || [])) if (f.branch_name) await deleteBranch(repo, f.branch_name);
+          }
+          await env.DB.prepare('DELETE FROM vip_files WHERE chat_id = ?').bind(targetChatId).run();
+          await sendMsg(targetChatId,
+            `🔄 <b>اطلاعات مخزن شما ریست شد.</b>\n\nتمام فایل‌های ذخیره‌شده پاک شدند.`, null, TOKEN);
+          await editMsg(cbChatId, cbMsgId,
+            `✅ اطلاعات مخزن کاربر <code>${targetChatId}</code> ریست شد.`,
+            { inline_keyboard: [[{ text: '🔙 پروفایل کاربر', callback_data: `adm_user:${targetChatId}`, style: 'primary' }]] }, TOKEN);
+          return new Response('OK');
+        }
+      }
+
+      return new Response('OK');
+    }
+
+    // ============================================================
+    // پیام متنی / فایل
+    // ============================================================
+    if (!update.message) return new Response('OK');
+
+    const msg = update.message;
+    const chatId = msg.chat?.id?.toString();
+    const text = msg.text || '';
+
+    if (!chatId) return new Response('OK');
+
+    // ============================================================
+    // /admin — پنل مدیریت (فقط ادمین)
+    // ============================================================
+    if (text.startsWith('/admin')) {
+      if (!isAdmin(env, chatId)) {
+        await sendMsg(chatId, `🔒 دسترسی مجاز نیست.`, null, TOKEN);
+        return new Response('OK');
+      }
+      await showAdminMenu(chatId, TOKEN);
+      return new Response('OK');
+    }
+
+    // ============================================================
+    // /start
+    // ============================================================
+    if (text.startsWith('/start')) {
+      const param = text.substring(6).trim();
+      const firstName = msg.from?.first_name || 'کاربر';
+      const bot1 = env.BOT1_USERNAME || 'filesmanagement_bot';
+
+      // ادمین مستقیم به پنل مدیریت می‌رود
+      if (isAdmin(env, chatId)) {
+        await showAdminMenu(chatId, TOKEN);
+        return new Response('OK');
+      }
+
+      const user = await getUser(env, chatId);
+
+      // ================================================================
+      // تابع کمکی: تمدید/فعال‌سازی با توکن VR (خرید یا تمدید واقعی)
+      // فایل‌های قبلی حذف نمی‌شوند — فقط مدت اعتبار افزوده می‌شود
+      // ================================================================
+      const handleRenewalToken = async () => {
+        const payload = await verifyRenewalToken(env, param);
+        if (!payload || payload.chatId !== chatId) {
+          await sendMsg(chatId, '❌ لینک تمدید نامعتبر یا منقضی شده.', backKeyboard(), TOKEN);
+          return;
+        }
+        const { txnId } = payload;
+
+        // ============================================================
+        // تشخیص تراکنش تکراری — کاملاً مستقل از ربات اول
+        // اگر txn_id دارد: از جدول vip_consumed_txn چک می‌کند
+        // اگر ندارد (backward compat): از vip_onboard_tokens چک می‌کند
+        // ============================================================
+        if (txnId) {
+          // ============================================================
+          // اگر txn_id قبلاً consumed شده → این کاربر قبلاً فعال/تمدید شده
+          // در این حالت نباید تمدید مجدد انجام شود — فقط خوش‌آمد بگو
+          // ============================================================
+          const alreadyConsumed = await isTxnConsumed(env, txnId);
+          if (alreadyConsumed) {
+            // کاربر قبلاً با این txn_id فعال شده — فقط منوی اصلی نشان بده
+            const existingUser = await getUser(env, chatId);
+            if (existingUser && existingUser.status === 'active') {
+              await env.DB.prepare('UPDATE vip_users SET first_name = ?, username = ? WHERE chat_id = ?')
+                .bind(firstName, msg.from?.username || '', chatId).run();
+              await showMain(chatId, { ...existingUser, first_name: firstName }, TOKEN, env);
+            } else {
+              await sendMsg(chatId,
+                `👑 <b>خوش آمدید!</b>
+
+اشتراک شما فعال است.`,
+                null, TOKEN);
+              if (existingUser) await showMain(chatId, existingUser, TOKEN, env);
+            }
+            return; // خروج بدون تمدید مجدد
+          }
+          // txn جدید است — ادامه برای تمدید/فعال‌سازی
+          await markTxnConsumed(env, txnId);
+        } else {
+          // backward compat: بدون txn_id از hash توکن استفاده می‌کنیم
+          const tokenHash = param.substring(0, 32);
+          const used = await env.DB.prepare('SELECT token_hash FROM vip_onboard_tokens WHERE token_hash = ?')
+            .bind(tokenHash).first();
+          if (used) {
+            // قدیمی: هم consumed بود → خوش‌آمد
+            const existingUser = await getUser(env, chatId);
+            if (existingUser) await showMain(chatId, existingUser, TOKEN, env);
+            return;
+          }
+          await env.DB.prepare('INSERT OR IGNORE INTO vip_onboard_tokens (token_hash, used_at) VALUES (?, ?)')
+            .bind(tokenHash, Date.now()).run();
+        }
+
+        const now = Date.now();
+
+        if (!user) {
+          // کاربر کاملاً جدید — اول‌بار وارد ربات سوم می‌شود
+          const avail = await getAvailableRepo(env);
+          if (!avail) { await sendMsg(chatId, `❌ ریپوی آزادی موجود نیست. با پشتیبانی تماس بگیرید.`, null, TOKEN); return; }
+          const ok = await assignRepoToUser(env, chatId, avail.key, now, now + SUBSCRIPTION_DAYS * 86400000, msg.from?.username || '', firstName);
+          if (!ok) { await sendMsg(chatId, `❌ خطا در تخصیص مخزن. دوباره تلاش کنید.`, null, TOKEN); return; }
+          const newUser = await getUser(env, chatId);
+          await sendMsg(chatId,
+            `👑 <b>خوش آمدید به VIP!</b>\n\n✅ اشتراک اختصاصی فعال شد.\n📅 اعتبار: <b>${SUBSCRIPTION_DAYS} روز</b>\n💾 فضا: <b>${formatBytes(MAX_STORAGE_BYTES)}</b>`, null, TOKEN);
+          await showMain(chatId, newUser, TOKEN, env);
+          return;
+        }
+
+        if (user.status === 'active' && user.repo_key) {
+          // کاربر فعال — تمدید اشتراک بدون حذف فایل‌های قبلی
+          // اگر expires_at هنوز در آینده است، ۳۰ روز از آن اضافه می‌شود
+          const currentExpiry = user.expires_at || now;
+          const newExpiry = Math.max(currentExpiry, now) + SUBSCRIPTION_DAYS * 86400000;
+          await env.DB.prepare('UPDATE vip_users SET subscribed_at = ?, expires_at = ?, first_name = ?, username = ? WHERE chat_id = ?')
+            .bind(now, newExpiry, firstName, msg.from?.username || '', chatId).run();
+          const updated = await getUser(env, chatId);
+          const newExpiryDate = new Date(newExpiry).toLocaleDateString('fa-IR');
+          await sendMsg(chatId,
+            `✅ <b>اشتراک VIP تمدید شد!</b>\n\n📅 اعتبار جدید تا: <b>${newExpiryDate}</b>\n💾 فایل‌های قبلی شما دست‌نخورده باقی مانده‌اند.`,
+            null, TOKEN);
+          await showMain(chatId, { ...updated, first_name: firstName }, TOKEN, env);
+          return;
+        }
+
+        if (user.status === 'grace') {
+          // دوره مهلت — تمدید + بازگشت به active (فایل‌ها هنوز حذف نشده‌اند)
+          const repoKey = user.repo_key || user.repo_key_backup;
+          if (repoKey) {
+            await env.DB.prepare("UPDATE vip_users SET status = 'active', repo_key = ?, repo_key_backup = NULL, subscribed_at = ?, expires_at = ?, first_name = ?, username = ? WHERE chat_id = ?")
+              .bind(repoKey, now, now + SUBSCRIPTION_DAYS * 86400000, firstName, msg.from?.username || '', chatId).run();
+          } else {
+            const avail = await getAvailableRepo(env);
+            if (!avail) { await sendMsg(chatId, `❌ ریپوی آزادی موجود نیست.`, null, TOKEN); return; }
+            const ok = await assignRepoToUser(env, chatId, avail.key, now, now + SUBSCRIPTION_DAYS * 86400000, msg.from?.username || '', firstName);
+            if (!ok) { await sendMsg(chatId, `❌ خطا در تخصیص مخزن. دوباره تلاش کنید.`, null, TOKEN); return; }
+          }
+          const updated = await getUser(env, chatId);
+          await sendMsg(chatId, `✅ <b>اشتراک تمدید شد!</b>\n\n💾 فایل‌های قبلی شما دست‌نخورده‌اند.`, null, TOKEN);
+          await showMain(chatId, { ...updated, first_name: firstName }, TOKEN, env);
+          return;
+        }
+
+        if (user.status === 'revoked') {
+          // اشتراک لغو شده — فایل‌های قبلی قبلاً حذف شده — ریپو تمیز اختصاص می‌گیرد
+          const repoKey = user.repo_key_backup || (await getAvailableRepo(env))?.key;
+          if (!repoKey) { await sendMsg(chatId, `❌ ریپوی آزادی موجود نیست.`, null, TOKEN); return; }
+          const ok = await assignRepoToUser(env, chatId, repoKey, now, now + SUBSCRIPTION_DAYS * 86400000, msg.from?.username || '', firstName);
+          if (!ok) { await sendMsg(chatId, `❌ خطا در تخصیص مخزن. دوباره تلاش کنید.`, null, TOKEN); return; }
+          const updated = await getUser(env, chatId);
+          await sendMsg(chatId,
+            `👑 <b>اشتراک VIP مجدداً فعال شد!</b>\n\n✅ ${SUBSCRIPTION_DAYS} روز\n💾 ${formatBytes(MAX_STORAGE_BYTES)} فضای اختصاصی`, null, TOKEN);
+          await showMain(chatId, updated, TOKEN, env);
+          return;
+        }
+      };
+
+      // ================================================================
+      // توکن VR (تمدید/خرید) — اول از همه بررسی می‌شود، در هر وضعیتی
+      // ================================================================
+      if (param.startsWith('VR')) {
+        await handleRenewalToken();
+        return new Response('OK');
+      }
+
+      // ================================================================
+      // کاربر فعال + توکن V یا بدون توکن → فقط خوش‌آمد (بدون تغییر اشتراک)
+      // ================================================================
+      if (user && user.status === 'active' && user.repo_key) {
+        await env.DB.prepare('UPDATE vip_users SET first_name = ?, username = ? WHERE chat_id = ?')
+          .bind(firstName, msg.from?.username || '', chatId).run();
+        await showMain(chatId, { ...user, first_name: firstName }, TOKEN, env);
+        return new Response('OK');
+      }
+
+      // ================================================================
+      // کاربر grace بدون توکن VR → راهنما برای تمدید
+      // ================================================================
+      if (user && user.status === 'grace') {
+        await sendMsg(chatId,
+          `⚠️ <b>اشتراک شما منقضی شده است</b>\n\nبرای تمدید از ربات اصلی اقدام کنید:`,
+          { inline_keyboard: [[{ text: '🔄 تمدید اشتراک', url: `https://t.me/${bot1}`, style: 'success' }]] }, TOKEN);
+        return new Response('OK');
+      }
+
+      // ================================================================
+      // کاربر revoked بدون توکن VR → راهنمای خرید
+      // ================================================================
+      if (user && user.status === 'revoked') {
+        await sendMsg(chatId,
+          `❌ <b>اشتراک شما به پایان رسیده است</b>\n\nبرای خرید مجدد اشتراک VIP:`,
+          { inline_keyboard: [[{ text: '🛒 خرید اشتراک', url: `https://t.me/${bot1}`, style: 'success' }]] }, TOKEN);
+        return new Response('OK');
+      }
+
+      // ================================================================
+      // کاربر جدید با توکن V (backward compat — نباید پیش بیاید)
+      // ================================================================
+      if (!user && param && !param.startsWith('VR')) {
+        const payload = await verifyVipToken(env, param);
+        if (!payload || payload.chatId !== chatId) {
+          await sendMsg(chatId, `❌ لینک نامعتبر یا منقضی شده.`, null, TOKEN);
+          return new Response('OK');
+        }
+        const used = await env.DB.prepare('SELECT token_hash FROM vip_onboard_tokens WHERE token_hash = ?').bind(param.substring(0, 32)).first();
+        if (used) { await sendMsg(chatId, `❌ این لینک قبلاً استفاده شده.`, null, TOKEN); return new Response('OK'); }
+        await env.DB.prepare('INSERT OR IGNORE INTO vip_onboard_tokens (token_hash, used_at) VALUES (?, ?)').bind(param.substring(0, 32), Date.now()).run();
+        const avail = await getAvailableRepo(env);
+        if (!avail) { await sendMsg(chatId, `❌ ریپوی آزادی موجود نیست. با پشتیبانی تماس بگیرید.`, null, TOKEN); return new Response('OK'); }
+        const now = Date.now();
+        const ok = await assignRepoToUser(env, chatId, avail.key, now, now + SUBSCRIPTION_DAYS * 86400000, msg.from?.username || '', firstName);
+        if (!ok) { await sendMsg(chatId, `❌ خطا در تخصیص مخزن. دوباره تلاش کنید.`, null, TOKEN); return new Response('OK'); }
+        const newUser = await getUser(env, chatId);
+        await sendMsg(chatId,
+          `👑 <b>خوش آمدید به VIP!</b>\n\n✅ اشتراک اختصاصی فعال شد.\n📅 اعتبار: <b>${SUBSCRIPTION_DAYS} روز</b>\n💾 فضا: <b>${formatBytes(MAX_STORAGE_BYTES)}</b>`, null, TOKEN);
+        await showMain(chatId, newUser, TOKEN, env);
+        return new Response('OK');
+      }
+
+      // بدون توکن و بدون اشتراک
+      await sendMsg(chatId, `🔒 <b>ربات اختصاصی VIP</b>\n\nاین ربات فقط برای کاربران دارای اشتراک VIP است.`,
+        { inline_keyboard: [[{ text: '🛒 خرید اشتراک', url: `https://t.me/${bot1}`, style: 'success' }]] }, TOKEN);
+      return new Response('OK');
+    }
+    // بررسی کاربر برای همه پیام‌های بعدی
+    const user = await getUser(env, chatId);
+    // ادمین می‌تواند بدون اشتراک VIP از ربات استفاده کند
+    if (!isAdmin(env, chatId)) {
+      if (!user || user.status === 'revoked') {
+        await sendMsg(chatId, `🔒 دسترسی VIP ندارید.`,
+          { inline_keyboard: [[{ text: '🛒 خرید اشتراک', url: `https://t.me/${env.BOT1_USERNAME || 'filesmanagement_bot'}`, style: 'success' }]] }, TOKEN);
+        return new Response('OK');
+      }
+      if (user.status === 'grace') {
+        await sendMsg(chatId, `⚠️ اشتراک منقضی. برای ادامه تمدید کنید.`,
+          { inline_keyboard: [[{ text: '🔄 تمدید', url: `https://t.me/${env.BOT1_USERNAME || 'filesmanagement_bot'}`, style: 'success' }]] }, TOKEN);
+        return new Response('OK');
+      }
+    }
+
+    // State handler
+    const state = await getState(env, chatId);
+
+    // دریافت URL
+    if (state?.step === 'awaiting_url') {
+      if (!text.match(/^https?:\/\//)) {
+        await sendMsg(chatId, `❌ لینک معتبر نیست. یک URL وارد کنید.`, cancelKeyboard(), TOKEN);
+        return new Response('OK');
+      }
+      const fileName = text.split('/').pop()?.split('?')[0] || 'file';
+      await setState(env, chatId, { step: 'awaiting_pass', type: 'link', fileUrl: text, fileName });
+      const passBtn = generatePassword();
+      await sendMsg(chatId, `📥 لینک دریافت شد.\n\n🔑 رمز فایل را تایپ کنید یا رمز تصادفی بزنید:`, passKeyboard(passBtn), TOKEN);
+      return new Response('OK');
+    }
+
+    // دریافت فایل آپلود‌شده
+    if (state?.step === 'awaiting_file') {
+      const doc = msg.document || msg.video || msg.audio || (msg.photo && msg.photo[msg.photo.length - 1]);
+      if (!doc) {
+        await sendMsg(chatId, `❌ فایل دریافت نشد. لطفاً یک فایل ارسال کنید.`, cancelKeyboard(), TOKEN);
+        return new Response('OK');
+      }
+      await setState(env, chatId, { step: 'awaiting_pass', type: 'upload', fileId: doc.file_id, msgId: msg.message_id, fileName: doc.file_name || 'file', fileSize: doc.file_size || 0 });
+      const passBtn = generatePassword();
+      await sendMsg(chatId, `✅ فایل دریافت شد.\n\n🔑 رمز فایل را تایپ کنید یا رمز تصادفی بزنید:`, passKeyboard(passBtn), TOKEN);
+      return new Response('OK');
+    }
+
+    // دریافت لینک یوتیوب
+    if (state?.step === 'awaiting_yt_url') {
+      const ytRegex = /^https?:\/\/(www\.)?(youtube\.com\/(watch\?v=|shorts\/|embed\/)|youtu\.be\/)/i;
+      if (!ytRegex.test(text.trim())) {
+        await sendMsg(chatId, `❌ لینک یوتیوب معتبر نیست.`, cancelKeyboard(), TOKEN);
+        return new Response('OK');
+      }
+      await setState(env, chatId, { step: 'awaiting_yt_quality', youtubeUrl: text.trim(), type: 'youtube' });
+      await sendMsg(chatId, `🎬 <b>کیفیت ویدیو را انتخاب کنید:</b>`,
+        { inline_keyboard: [
+          [
+            { text: '📺 1080p', callback_data: 'yt_q:1080', style: 'primary' },
+            { text: '📺 720p',  callback_data: 'yt_q:720',  style: 'primary' },
+            { text: '📺 480p',  callback_data: 'yt_q:480',  style: 'primary' },
+          ],
+          [{ text: '❌ انصراف', callback_data: 'cancel', style: 'danger' }],
+        ] }, TOKEN);
+      return new Response('OK');
+    }
+
+    // دریافت رمز (متنی)
+    if (state?.step === 'awaiting_pass') {
+      const password = text.trim().replace(/[^A-Za-z0-9!@#$%^&*.\-]/g, '').substring(0, 12);
+      if (password.length < 3) {
+        await sendMsg(chatId, `❌ رمز باید حداقل ۳ کاراکتر باشد.`, cancelKeyboard(), TOKEN);
+        return new Response('OK');
+      }
+      await deleteState(env, chatId);
+      await startDownload(env, chatId, state, password, user, TOKEN);
+      return new Response('OK');
+    }
+
+    // ============================================================
+    // پردازش state های ادمین
+    // ============================================================
+    if (isAdmin(env, chatId)) {
+      const admState = await getState(env, chatId);
+
+      // دریافت اطلاعات مخزن جدید با فرمت owner/repo/GH_TOKEN_X
+      if (admState?.step === 'adm_addrepo_input') {
+        await deleteState(env, chatId);
+        const parts = text.trim().split('/');
+        if (parts.length !== 3 || !parts[0] || !parts[1] || !parts[2]) {
+          await sendMsg(chatId,
+            `❌ فرمت نادرست.\n\nباید به شکل <code>owner/repo-name/GH_TOKEN_1</code> باشد.`,
+            { inline_keyboard: [[{ text: '🔙 مخازن', callback_data: 'adm_repos', style: 'primary' }]] }, TOKEN);
+          return new Response('OK');
+        }
+        const [owner, repoName, tokenSecret] = parts.map(p => p.trim());
+        // بررسی وجود توکن در env
+        if (!env[tokenSecret]) {
+          await sendMsg(chatId,
+            `❌ Secret با نام <code>${tokenSecret}</code> در Cloudflare یافت نشد.\n\nابتدا آن را در Workers > Settings > Variables and Secrets اضافه کنید، سپس دوباره تلاش کنید.`,
+            { inline_keyboard: [[{ text: '🔙 مخازن', callback_data: 'adm_repos', style: 'primary' }]] }, TOKEN);
+          return new Response('OK');
+        }
+        // ساخت کلید خودکار: REPO_1، REPO_2، ...
+        const allRows = await env.DB.prepare('SELECT repo_key FROM repos ORDER BY repo_key ASC').all();
+        let maxNum = 0;
+        for (const r of (allRows.results || [])) {
+          const m = r.repo_key.match(/^REPO_(\d+)$/);
+          if (m) maxNum = Math.max(maxNum, parseInt(m[1]));
+        }
+        const newKey = `REPO_${maxNum + 1}`;
+        // بررسی تکراری نبودن owner/name
+        const exists = await env.DB.prepare('SELECT repo_key FROM repos WHERE owner = ? AND name = ?').bind(owner, repoName).first();
+        if (exists) {
+          await sendMsg(chatId,
+            `❌ مخزن <code>${owner}/${repoName}</code> قبلاً با کلید <b>${exists.repo_key}</b> اضافه شده.`,
+            { inline_keyboard: [[{ text: '🔙 مخازن', callback_data: 'adm_repos', style: 'primary' }]] }, TOKEN);
+          return new Response('OK');
+        }
+        await env.DB.prepare('INSERT INTO repos (repo_key, owner, name, token_secret, created_at) VALUES (?, ?, ?, ?, ?)')
+          .bind(newKey, owner, repoName, tokenSecret, Date.now()).run();
+        await sendMsg(chatId,
+          `✅ مخزن <b>${newKey}</b> اضافه شد!\n\n` +
+          `📦 <code>${owner}/${repoName}</code>\n🔑 Secret: <code>${tokenSecret}</code>`,
+          { inline_keyboard: [[{ text: '🗄 مشاهده مخازن', callback_data: 'adm_repos', style: 'primary' }]] }, TOKEN);
+        return new Response('OK');
+      }
+
+      // جستجوی کاربر بر اساس chat_id یا username
+      if (admState?.step === 'adm_search') {
+        await deleteState(env, chatId);
+        const query = text.trim().replace('@', '');
+        let targetUser = null;
+        // اول با chat_id چک کن
+        if (/^\d+$/.test(query)) {
+          targetUser = await getUser(env, query);
+        }
+        // بعد با username
+        if (!targetUser) {
+          targetUser = await env.DB.prepare('SELECT * FROM vip_users WHERE username = ?').bind(query).first();
+        }
+        if (!targetUser) {
+          await sendMsg(chatId, `❌ کاربری با این مشخصات یافت نشد.`,
+            { inline_keyboard: [[{ text: '🔙 منوی ادمین', callback_data: 'adm_menu', style: 'primary' }]] }, TOKEN);
+          return new Response('OK');
+        }
+        await showAdminUserProfile(env, chatId, targetUser.chat_id, TOKEN);
+        return new Response('OK');
+      }
+
+      // تغییر زمان اشتراک — دریافت تعداد روز
+      if (admState?.step === 'adm_chtime') {
+        const days = parseInt(text.trim());
+        if (isNaN(days) || days === 0) {
+          await sendMsg(chatId, `❌ عدد معتبر وارد کنید (مثبت برای افزایش، منفی برای کاهش).`,
+            { inline_keyboard: [[{ text: '❌ انصراف', callback_data: `adm_user:${admState.targetChatId}`, style: 'danger' }]] }, TOKEN);
+          return new Response('OK');
+        }
+        await deleteState(env, chatId);
+        const targetUser = await getUser(env, admState.targetChatId);
+        if (!targetUser) {
+          await sendMsg(chatId, `❌ کاربر یافت نشد.`, null, TOKEN);
+          return new Response('OK');
+        }
+        const currentExpiry = Math.max(targetUser.expires_at || Date.now(), Date.now());
+        const newExpiry = currentExpiry + days * 86400000;
+        await env.DB.prepare('UPDATE vip_users SET expires_at = ? WHERE chat_id = ?')
+          .bind(newExpiry, admState.targetChatId).run();
+        const newExpiryDate = new Date(newExpiry).toLocaleDateString('fa-IR');
+        // اطلاع به کاربر
+        const changeText = days > 0
+          ? `✅ <b>اشتراک شما تمدید شد!</b>\n\n📅 تاریخ انقضای جدید: <b>${newExpiryDate}</b>`
+          : `⚠️ <b>اشتراک شما کوتاه شد.</b>\n\n📅 تاریخ انقضای جدید: <b>${newExpiryDate}</b>`;
+        await sendMsg(admState.targetChatId, changeText, null, TOKEN);
+        await sendMsg(chatId,
+          `✅ زمان اشتراک کاربر <code>${admState.targetChatId}</code> به‌روز شد.\n📅 انقضای جدید: <b>${newExpiryDate}</b>`,
+          { inline_keyboard: [[{ text: '🔙 پروفایل کاربر', callback_data: `adm_user:${admState.targetChatId}`, style: 'primary' }]] }, TOKEN);
+        return new Response('OK');
+      }
+
+      // تغییر مخزن — دریافت کلید مخزن
+      if (admState?.step === 'adm_chrepo') {
+        const repoKey = text.trim().toUpperCase();
+        await deleteState(env, chatId);
+        const repo = await getRepoByKey(env, repoKey);
+        if (!repo) {
+          await sendMsg(chatId, `❌ مخزنی با کلید <b>${repoKey}</b> یافت نشد.\n\nکلیدها: REPO_1، REPO_2 و ...`,
+            { inline_keyboard: [[{ text: '🔙 پروفایل کاربر', callback_data: `adm_user:${admState.targetChatId}`, style: 'danger' }]] }, TOKEN);
+          return new Response('OK');
+        }
+        await env.DB.prepare('UPDATE vip_users SET repo_key = ? WHERE chat_id = ?')
+          .bind(repoKey, admState.targetChatId).run();
+        const targetUser = await getUser(env, admState.targetChatId);
+        // اطلاع به کاربر
+        await sendMsg(admState.targetChatId,
+          `🔄 <b>مخزن اختصاصی شما تغییر کرد.</b>\n\n📦 مخزن جدید: <b>${repo.owner}/${repo.name}</b>`, null, TOKEN);
+        await sendMsg(chatId,
+          `✅ مخزن کاربر <code>${admState.targetChatId}</code> به <b>${repoKey}</b> تغییر یافت.`,
+          { inline_keyboard: [[{ text: '🔙 پروفایل کاربر', callback_data: `adm_user:${admState.targetChatId}`, style: 'primary' }]] }, TOKEN);
+        return new Response('OK');
+      }
+    }
+
+    // منوی اصلی پیش‌فرض
+    await showMain(chatId, user, TOKEN, env);
+    return new Response('OK');
+  },
+
+  async scheduled(event, env, ctx) {
+  const TOKEN = env.TELEGRAM_TOKEN;
+  if (TOKEN) {
+    ctx.waitUntil(initDB(env)); // اضافه کنید
+    ctx.waitUntil(checkExpired(env, TOKEN));
+  }
+}
+};
